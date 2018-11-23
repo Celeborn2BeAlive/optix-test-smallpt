@@ -101,7 +101,20 @@ TriangleHit triIntersect(optix::float3 ro, optix::float3 rd, optix::float3 v0, o
     return { t, u, v };
 }
 
-float intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & mesh)
+struct Vec {        // Usage: time ./smallpt 5000 && xv image.ppm
+    double x, y, z;                  // position, also color (r,g,b)
+    Vec(double x_ = 0, double y_ = 0, double z_ = 0) { x = x_; y = y_; z = z_; }
+    Vec operator+(const Vec &b) const { return Vec(x + b.x, y + b.y, z + b.z); }
+    Vec operator-(const Vec &b) const { return Vec(x - b.x, y - b.y, z - b.z); }
+    Vec operator*(double b) const { return Vec(x*b, y*b, z*b); }
+    Vec mult(const Vec &b) const { return Vec(x*b.x, y*b.y, z*b.z); }
+    Vec& norm() { return *this = *this * (1 / sqrt(x*x + y*y + z*z)); }
+    double dot(const Vec &b) const { return x*b.x + y*b.y + z*b.z; }
+    Vec operator%(const Vec&b) const { return Vec(y*b.z - z*b.y, z*b.x - x*b.z, x*b.y - y*b.x); } // cross product
+    operator optix::float3() const { return optix::float3{ float(x), float(y), float(z) }; }
+};
+
+float intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & mesh, Vec & x, Vec & n)
 {
     auto minDistance = std::numeric_limits<float>::max();
     for (size_t i = 0; i < mesh.indexBuffer.size(); i += 3) {
@@ -116,18 +129,6 @@ float intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & 
     return minDistance > 0 ? minDistance : 0.f;
 }
 
-struct Vec {        // Usage: time ./smallpt 5000 && xv image.ppm
-    double x, y, z;                  // position, also color (r,g,b)
-    Vec(double x_ = 0, double y_ = 0, double z_ = 0) { x = x_; y = y_; z = z_; }
-    Vec operator+(const Vec &b) const { return Vec(x + b.x, y + b.y, z + b.z); }
-    Vec operator-(const Vec &b) const { return Vec(x - b.x, y - b.y, z - b.z); }
-    Vec operator*(double b) const { return Vec(x*b, y*b, z*b); }
-    Vec mult(const Vec &b) const { return Vec(x*b.x, y*b.y, z*b.z); }
-    Vec& norm() { return *this = *this * (1 / sqrt(x*x + y*y + z*z)); }
-    double dot(const Vec &b) const { return x*b.x + y*b.y + z*b.z; }
-    Vec operator%(const Vec&b) const { return Vec(y*b.z - z*b.y, z*b.x - x*b.z, x*b.y - y*b.x); } // cross product
-    operator optix::float3() const { return optix::float3{ float(x), float(y), float(z) }; }
-};
 struct Ray { Vec o, d; Ray(Vec o_, Vec d_) : o(o_), d(d_) {} };
 enum Refl_t { DIFF, SPEC, REFR };  // material types, used in radiance()
 struct Sphere {
@@ -140,19 +141,24 @@ struct Sphere {
     Sphere(double rad_, Vec p_, Vec e_, Vec c_, Refl_t refl_) :
         rad(rad_), p(p_), e(e_), c(c_), refl(refl_), mesh{makeSphere(p_, rad_)} {}
 
-    double intersectAnalytic(const Ray &r) const { // returns distance, 0 if nohit
+    double intersectAnalytic(const Ray &r, Vec & x, Vec & n) const { // returns distance, 0 if nohit
         Vec op = p - r.o; // Solve t^2*d.d + 2*t*(o-p).d + (o-p).(o-p)-R^2 = 0
         double t, eps = 1e-4, b = op.dot(r.d), det = b*b - op.dot(op) + rad*rad;
         if (det < 0) return 0; else det = sqrt(det);
-        return (t = b - det) > eps ? t : ((t = b + det) > eps ? t : 0);
+        const auto dist = (t = b - det) > eps ? t : ((t = b + det) > eps ? t : 0);
+        if (dist > 0) {
+            x = r.o + r.d*dist;
+            n = (x - p).norm();
+        }
+        return dist;
     }
 
-    double intersectMesh(const Ray &r) const {
-        return ::intersect(r.o, r.d, mesh);
+    double intersectMesh(const Ray &r, Vec & x, Vec & n) const {
+        return ::intersect(r.o, r.d, mesh, x, n);
     }
 
-    double intersect(const Ray &r) const {
-        return intersectAnalytic(r);
+    double intersect(const Ray &r, Vec & x, Vec & n) const {
+        return intersectAnalytic(r, x, n);
     }
 };
 Sphere spheres[] = {//Scene: radius, position, emission, color, material
@@ -171,18 +177,39 @@ inline double clamp(double x) { return x < 0 ? 0 : x>1 ? 1 : x; }
 
 inline int toInt(double x) { return int(pow(clamp(x), 1 / 2.2) * 255 + .5); }
 
-inline bool intersect(const Ray &r, double &t, int &id) {
-    double n = sizeof(spheres) / sizeof(Sphere), d, inf = t = 1e20;
-    for (int i = int(n); i--;) if ((d = spheres[i].intersect(r)) && d < t) { t = d; id = i; }
-    return t < inf;
+struct Hit
+{
+    static inline double inf() { return 1e20; };
+    double t = inf();
+    int id;
+    Vec x;
+    Vec n;
+
+    explicit operator bool() const {
+        return t < inf();
+    }
+};
+
+inline Hit intersect(const Ray &r) {
+    Hit hit;
+    double count = sizeof(spheres) / sizeof(Sphere), d;
+    Vec x, n;
+    for (int i = int(count); i--;) {
+        if ((d = spheres[i].intersect(r, x, n)) && d < hit.t) {
+            hit.t = d;
+            hit.id = i;
+            hit.x = x;
+            hit.n = n;
+        }
+    }
+    return hit;
 }
 
 Vec radiance(const Ray &r, int depth, std::mt19937 & generator) {
-    double t;                               // distance to intersection
-    int id = 0;                               // id of intersected object
-    if (!intersect(r, t, id)) return Vec(); // if miss, return black
-    const Sphere &obj = spheres[id];        // the hit object
-    Vec x = r.o + r.d*t, n = (x - obj.p).norm(), nl = n.dot(r.d) < 0 ? n : n*-1, f = obj.c;
+    const auto hit = intersect(r);
+    if (!hit) return Vec(); // if miss, return black
+    const Sphere &obj = spheres[hit.id];        // the hit object
+    Vec x = hit.x, n = hit.n, nl = n.dot(r.d) < 0 ? n : n*-1, f = obj.c;
     double p = f.x > f.y && f.x > f.z ? f.x : f.y > f.z ? f.y : f.z; // max refl
     if (++depth > 5) if (rand_float(generator) < p && depth < 32) f = f*(1 / p); else return obj.e; //R.R.
     if (obj.refl == DIFF) {                  // Ideal DIFFUSE reflection
