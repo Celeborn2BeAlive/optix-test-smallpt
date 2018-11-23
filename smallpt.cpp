@@ -18,7 +18,7 @@ double rand_float(std::mt19937 & generator) {
 struct TriMesh {
     std::vector<optix::float3> positionBuffer;
     std::vector<optix::float3> normalBuffer;
-    std::vector<std::uint32_t> indexBuffer;
+    std::vector<uint32_t> indexBuffer;
 
     size_t triangleCount() const
     {
@@ -26,7 +26,7 @@ struct TriMesh {
     }
 };
 
-TriMesh makeSphere(const optix::float3 origin, float radius, const std::uint32_t subdivLongitude = 4)
+TriMesh makeSphere(const optix::float3 origin, float radius, const uint32_t subdivLongitude = 4)
 {
     const auto discLong = subdivLongitude;
     const auto discLat = 2 * discLong;
@@ -104,6 +104,7 @@ TriangleHit triIntersect(optix::float3 ro, optix::float3 rd, optix::float3 v0, o
 struct Vec {        // Usage: time ./smallpt 5000 && xv image.ppm
     double x, y, z;                  // position, also color (r,g,b)
     Vec(double x_ = 0, double y_ = 0, double z_ = 0) { x = x_; y = y_; z = z_; }
+    Vec(optix::float3 v) : Vec(v.x, v.y, v.z) {}
     Vec operator+(const Vec &b) const { return Vec(x + b.x, y + b.y, z + b.z); }
     Vec operator-(const Vec &b) const { return Vec(x - b.x, y - b.y, z - b.z); }
     Vec operator*(double b) const { return Vec(x*b, y*b, z*b); }
@@ -117,6 +118,8 @@ struct Vec {        // Usage: time ./smallpt 5000 && xv image.ppm
 float intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & mesh, Vec & x, Vec & n)
 {
     auto minDistance = std::numeric_limits<float>::max();
+    uint32_t minIdx;
+    TriangleHit minHit;
     for (size_t i = 0; i < mesh.indexBuffer.size(); i += 3) {
         const auto i1 = mesh.indexBuffer[i];
         const auto i2 = mesh.indexBuffer[i + 1];
@@ -124,9 +127,22 @@ float intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & 
         const auto hit = triIntersect(ro, rd, mesh.positionBuffer[i1], mesh.positionBuffer[i2], mesh.positionBuffer[i3]);
         if (hit.distance > 0 && hit.distance < minDistance) {
             minDistance = hit.distance;
+            minIdx = i1;
+            minHit = hit;
         }
     }
-    return minDistance > 0 ? minDistance : 0.f;
+
+    if (minDistance <= 0.f || minDistance == std::numeric_limits<float>::max())
+        return 0.f;
+
+    x = ro + minDistance * rd;
+    const auto i1 = mesh.indexBuffer[minIdx];
+    const auto i2 = mesh.indexBuffer[minIdx + 1];
+    const auto i3 = mesh.indexBuffer[minIdx + 2];
+
+    n = (1 - minHit.u - minHit.v) * mesh.normalBuffer[i1] + minHit.u * mesh.normalBuffer[i2] + minHit.v * mesh.normalBuffer[i3];
+
+    return minDistance;
 }
 
 struct Ray { Vec o, d; Ray(Vec o_, Vec d_) : o(o_), d(d_) {} };
@@ -158,7 +174,7 @@ struct Sphere {
     }
 
     double intersect(const Ray &r, Vec & x, Vec & n) const {
-        return intersectAnalytic(r, x, n);
+        return intersectMesh(r, x, n);
     }
 };
 Sphere spheres[] = {//Scene: radius, position, emission, color, material
