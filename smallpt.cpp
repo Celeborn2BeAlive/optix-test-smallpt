@@ -180,7 +180,7 @@ Sphere spheres[] = {//Scene: radius, position, emission, color, material
   //Sphere(1e5, Vec(50,-1e5 + 81.6,81.6),Vec(),Vec(.75,.75,.75),DIFF),//Top
   //Sphere(16.5,Vec(27,16.5,47),       Vec(),Vec(1,1,1)*.999, SPEC),//Mirr
   //Sphere(16.5,Vec(73,16.5,78),       Vec(),Vec(1,1,1)*.999, REFR),//Glas
-  Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(12,12,12),  make_float3(), DIFF) //Lite
+  Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(1,1,1),  make_float3(), DIFF) //Lite
 };
 
 inline float clamp(float x) { return x < 0 ? 0 : x>1 ? 1 : x; }
@@ -294,7 +294,7 @@ int main(int argc, char *argv[]) {
                             cy*(((sy + .5 + dy) / 2 + y) / h - .5) + cam.d;
                         r = r + radiance(Ray(cam.o + d * 140, normalize(d)), 0, generator)*(1. / samps);
                     } // Camera rays are pushed ^^^^^ forward to start in interior
-                    c[i] = c[i] + make_float3(clamp(r.x), clamp(r.y), clamp(r.z))*.25;
+                    c[i] = c[i] + r*.25;
                 }
             }
         }
