@@ -287,6 +287,7 @@ struct PathContrib
     uint32_t depth;
 };
 
+
 int main(int argc, char *argv[]) {
     const auto start = hr_clock::now();
 
@@ -304,7 +305,7 @@ int main(int argc, char *argv[]) {
     const int jitterSize = 2;
     pathBuffer.resize(h * w * jitterSize * jitterSize * samps);
 
-    const auto camRaysFuture = shn::asyncParallelLoop(h, threadCount, [&](auto y, auto threadId) // Loop over image rows
+    shn::syncParallelLoop(h, threadCount, [&](auto y, auto threadId) // Loop over image rows
     {
         std::mt19937 generator{ uint32_t(y*y*y) };
         for (unsigned short x = 0; x < w; x++) {   // Loop cols
@@ -333,14 +334,28 @@ int main(int argc, char *argv[]) {
         }
     });
 
-    camRaysFuture.wait();
+    // What i want is:
+    // const auto cameraRays = await(sampleCameraRays())
+    // sampleCameraRays returns future<std::vector<Ray>>
 
     const auto pixelCount = w * h;
-    std::vector<optix::float3> c(w * h, make_float3());
+    std::vector<optix::float3> c(pixelCount, make_float3());
+    std::vector<std::mt19937> generators(pixelCount);
+    shn::syncParallelLoop(pixelCount, threadCount, [&](auto pixelIdx, auto threadId)
+    {
+        generators[pixelIdx].seed(uint32_t(pixelIdx) * 12345);
+    });
+
+    // #todo
+    // change loop to asyncParallelRun, to keep control over threads
+    // Each thread process samples of a pixel
+    // At each iteration call radiance on each path, which generate another pathBuffer
+    // The processing ends when no more paths are generated
+
     std::atomic_uint pixelCounter = 0;
     const auto renderFuture = shn::asyncParallelLoop(pixelCount, threadCount, [&](auto pixelIdx, auto threadId)
     {
-        std::mt19937 generator{ uint32_t(pixelIdx) * 12345 };
+        auto & generator = generators[pixelIdx];
         const auto pathOffset = pixelIdx * jitterSize * jitterSize * samps;
         optix::float3 r = make_float3();
         for (auto pathIdx = pathOffset; pathIdx < pathBuffer.size() && pathBuffer[pathIdx].pixelIdx == pixelIdx; ++pathIdx)
