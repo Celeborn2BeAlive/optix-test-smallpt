@@ -137,7 +137,11 @@ float intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & 
     return minDistance;
 }
 
-struct Ray { optix::float3 o, d; Ray(optix::float3 o_, optix::float3 d_) : o(o_), d(d_) {} };
+struct Ray { 
+    optix::float3 o, d; 
+    Ray() = default;
+    Ray(optix::float3 o_, optix::float3 d_) : o(o_), d(d_) {} 
+};
 enum Refl_t { DIFF, SPEC, REFR };  // material types, used in radiance()
 struct Sphere {
     float rad;       // radius
@@ -180,7 +184,7 @@ Sphere spheres[] = {//Scene: radius, position, emission, color, material
   //Sphere(1e5, Vec(50,-1e5 + 81.6,81.6),Vec(),Vec(.75,.75,.75),DIFF),//Top
   //Sphere(16.5,Vec(27,16.5,47),       Vec(),Vec(1,1,1)*.999, SPEC),//Mirr
   //Sphere(16.5,Vec(73,16.5,78),       Vec(),Vec(1,1,1)*.999, REFR),//Glas
-  Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(12,12,12),  make_float3(), DIFF) //Lite
+  Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(1,1,1),  make_float3(), DIFF) //Lite
 };
 
 inline float clamp(float x) { return x < 0 ? 0 : x>1 ? 1 : x; }
@@ -218,7 +222,7 @@ inline Hit intersect(const Ray &r) {
     return hit;
 }
 
-optix::float3 radiance(const Ray &r, int depth, std::mt19937 & generator) 
+optix::float3 radiance_rec(const Ray &r, int depth, std::mt19937 & generator) 
 {
     const auto hit = intersect(r);
 
@@ -247,22 +251,41 @@ optix::float3 radiance(const Ray &r, int depth, std::mt19937 & generator)
         float r1 = 2 * M_PI*rand_float(generator), r2 = rand_float(generator), r2s = sqrt(r2);
         optix::float3 w = nl, u = normalize(cross((fabs(w.x) > .1 ? make_float3(0, 1) : make_float3(1)), w)), v = cross(w, u);
         optix::float3 d = normalize(u*cos(r1)*r2s + v*sin(r1)*r2s + w*sqrt(1 - r2));
-        return obj.e + f * radiance(Ray(x, d), depth, generator);
+        return obj.e + f * radiance_rec(Ray(x, d), depth, generator);
     }
-    else if (obj.refl == SPEC)            // Ideal SPECULAR reflection
-        return obj.e + f * radiance(Ray(x, r.d - n * 2 * dot(n, r.d)), depth, generator);
+
+    if (obj.refl == SPEC)            // Ideal SPECULAR reflection
+        return obj.e + f * radiance_rec(Ray(x, r.d - n * 2 * dot(n, r.d)), depth, generator);
+
     Ray reflRay(x, r.d - n * 2 * dot(n, r.d));     // Ideal dielectric REFRACTION
+
     bool into = dot(n, nl) > 0;                // Ray from outside going in?
-    float nc = 1, nt = 1.5, nnt = into ? nc / nt : nt / nc, ddn = dot(r.d, nl), cos2t;
+    float nc = 1;
+    float nt = 1.5;
+    float nnt = into ? nc / nt : nt / nc;
+    float ddn = dot(r.d, nl);
+    float cos2t;
+
     if ((cos2t = 1 - nnt*nnt*(1 - ddn*ddn)) < 0)    // Total internal reflection
-        return obj.e + f * radiance(reflRay, depth, generator);
+        return obj.e + f * radiance_rec(reflRay, depth, generator);
+
     optix::float3 tdir = normalize(r.d*nnt - n*((into ? 1 : -1)*(ddn*nnt + sqrt(cos2t))));
+
     float a = nt - nc, b = nt + nc, R0 = a*a / (b*b), c = 1 - (into ? -ddn : dot(tdir, n));
     float Re = R0 + (1 - R0)*c*c*c*c*c, Tr = 1 - Re, P = .25 + .5*Re, RP = Re / P, TP = Tr / (1 - P);
+
     return obj.e + f * (depth > 2 ? (rand_float(generator) < P ?   // Russian roulette
-        radiance(reflRay, depth, generator)*RP : radiance(Ray(x, tdir), depth, generator)*TP) :
-        radiance(reflRay, depth, generator)*Re + radiance(Ray(x, tdir), depth, generator)*Tr);
+        radiance_rec(reflRay, depth, generator)*RP : radiance_rec(Ray(x, tdir), depth, generator)*TP) : (radiance_rec(reflRay, depth, generator)*Re + radiance_rec(Ray(x, tdir), depth, generator)*Tr));
 }
+
+struct PathContrib
+{
+    uint32_t pixelIdx;
+    uint32_t pathIdx;
+    optix::float3 weight;
+    Ray currentRay;
+    uint32_t depth;
+};
 
 int main(int argc, char *argv[]) {
     const auto start = hr_clock::now();
@@ -279,31 +302,63 @@ int main(int argc, char *argv[]) {
 
     const auto threadCount = shn::getSystemThreadCount() - 2;
 
+    std::vector<PathContrib> pathBuffer;
+    const int jitterSize = 2;
+    pathBuffer.resize(h * w * jitterSize * jitterSize * samps);
+
     std::atomic_uint rowCounter = 0;
-    const auto renderFuture = shn::asyncParallelLoop(h, threadCount, [&](auto y, auto threadId) // Loop over image rows
+    const auto camRaysFuture = shn::asyncParallelLoop(h, threadCount, [&](auto y, auto threadId) // Loop over image rows
     {
         std::mt19937 generator{ uint32_t(y*y*y) };
         for (unsigned short x = 0; x < w; x++) {   // Loop cols
-            for (int sy = 0, i = (h - y - 1)*w + x; sy < 2; sy++) {     // 2x2 subpixel rows
-                for (int sx = 0; sx < 2; sx++) {        // 2x2 subpixel cols
+            const int pixelIdx = (h - y - 1)*w + x;
+            for (int sy = 0; sy < jitterSize; sy++) {     // 2x2 subpixel rows
+                for (int sx = 0; sx < jitterSize; sx++) {        // 2x2 subpixel cols
+                    const int jitterIdx = sx + sy * jitterSize;
                     optix::float3 r = make_float3();
                     for (int s = 0; s < samps; s++) {
                         float r1 = 2 * rand_float(generator), dx = r1 < 1 ? sqrt(r1) - 1 : 1 - sqrt(2 - r1);
                         float r2 = 2 * rand_float(generator), dy = r2 < 1 ? sqrt(r2) - 1 : 1 - sqrt(2 - r2);
                         optix::float3 d = cx*(((sx + .5 + dx) / 2 + x) / w - .5) +
                             cy*(((sy + .5 + dy) / 2 + y) / h - .5) + cam.d;
-                        r = r + radiance(Ray(cam.o + d * 140, normalize(d)), 0, generator)*(1. / samps);
-                    } // Camera rays are pushed ^^^^^ forward to start in interior
-                    c[i] = c[i] + make_float3(clamp(r.x), clamp(r.y), clamp(r.z))*.25;
+                        const Ray cameraRay(Ray(cam.o + d * 140, normalize(d))); // Camera rays are pushed forward to start in interior
+
+                        const auto pathIdx = pixelIdx * jitterSize * jitterSize * samps + jitterIdx * samps + s;
+                        auto & path = pathBuffer[pathIdx];
+                        path.currentRay = cameraRay;
+                        path.pathIdx = pathIdx;
+                        path.pixelIdx = pixelIdx;
+                        path.weight = optix::float3{ 1,1,1 };
+                        path.depth = 0;
+                    }
                 }
             }
         }
         ++rowCounter;
     });
 
+    camRaysFuture.wait();
+
+    std::atomic_uint pixelCounter = 0;
+    const auto renderFuture = shn::asyncParallelLoop(w * h, threadCount, [&](auto pixelIdx, auto threadId)
+    {
+        std::mt19937 generator{ uint32_t(pixelIdx) * 12345 };
+        const auto pathOffset = pixelIdx * jitterSize * jitterSize * samps;
+        optix::float3 r = make_float3();
+        for (auto pathIdx = pathOffset; pathIdx < pathBuffer.size() && pathBuffer[pathIdx].pixelIdx == pixelIdx; ++pathIdx)
+        {
+            auto & path = pathBuffer[pathIdx];
+            r = r + radiance_rec(path.currentRay, path.depth, generator);
+        }
+        r = r / float(samps * jitterSize * jitterSize);
+        c[pixelIdx] = r;
+
+        ++pixelCounter;
+    });
+
     while (renderFuture.wait_for(std::chrono::milliseconds(33)) != std::future_status::ready)
     {
-        fprintf(stderr, "\rRendering (%d spp) %5.2f%%", samps * 4, 100. * rowCounter / (h - 1));
+        fprintf(stderr, "\rRendering (%d spp) %5.2f%%", samps * 4, 100. * pixelCounter / (w * h));
     }
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(hr_clock::now() - start);
