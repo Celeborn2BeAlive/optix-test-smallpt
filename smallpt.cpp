@@ -106,7 +106,7 @@ TriangleHit triIntersect(optix::float3 ro, optix::float3 rd, optix::float3 v0, o
     return { t, u, v };
 }
 
-float intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & mesh, optix::float3 & x, optix::float3 & n)
+float intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & mesh, optix::float3 & x, optix::float3 & n, optix::float2 & uv)
 {
     auto minDistance = std::numeric_limits<float>::max();
     uint32_t minIdx;
@@ -118,7 +118,7 @@ float intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & 
         const auto hit = triIntersect(ro, rd, mesh.positionBuffer[i1], mesh.positionBuffer[i2], mesh.positionBuffer[i3]);
         if (hit.distance > 0 && hit.distance < minDistance) {
             minDistance = hit.distance;
-            minIdx = i1;
+            minIdx = i;
             minHit = hit;
         }
     }
@@ -132,6 +132,7 @@ float intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & 
     const auto i3 = mesh.indexBuffer[minIdx + 2];
 
     n = (1 - minHit.u - minHit.v) * mesh.normalBuffer[i1] + minHit.u * mesh.normalBuffer[i2] + minHit.v * mesh.normalBuffer[i3];
+    uv = optix::float2{ minHit.u, minHit.v };
 
     return minDistance;
 }
@@ -148,7 +149,7 @@ struct Sphere {
     Sphere(float rad_, optix::float3 p_, optix::float3 e_, optix::float3 c_, Refl_t refl_) :
         rad(rad_), p(p_), e(e_), c(c_), refl(refl_), mesh{makeSphereTriMesh(p_, rad_)} {}
 
-    float intersectAnalytic(const Ray &r, optix::float3 & x, optix::float3 & n) const { // returns distance, 0 if nohit
+    float intersectAnalytic(const Ray &r, optix::float3 & x, optix::float3 & n, optix::float2 & uv) const { // returns distance, 0 if nohit
         optix::float3 op = p - r.o; // Solve t^2*d.d + 2*t*(o-p).d + (o-p).(o-p)-R^2 = 0
         float t, eps = 1e-4, b = dot(op, r.d), det = b*b - dot(op, op) + rad*rad;
         if (det < 0) return 0; else det = sqrt(det);
@@ -156,16 +157,17 @@ struct Sphere {
         if (dist > 0) {
             x = r.o + r.d*dist;
             n = optix::normalize(x - p);
+            uv = optix::float2{0.f, 0.f};
         }
         return dist;
     }
 
-    float intersectMesh(const Ray &r, optix::float3 & x, optix::float3 & n) const {
-        return ::intersect(r.o, r.d, mesh, x, n);
+    float intersectMesh(const Ray &r, optix::float3 & x, optix::float3 & n, optix::float2 & uv) const {
+        return ::intersect(r.o, r.d, mesh, x, n, uv);
     }
 
-    float intersect(const Ray &r, optix::float3 & x, optix::float3 & n) const {
-        return intersectAnalytic(r, x, n);
+    float intersect(const Ray &r, optix::float3 & x, optix::float3 & n, optix::float2 & uv) const {
+        return intersectMesh(r, x, n, uv);
     }
 };
 Sphere spheres[] = {//Scene: radius, position, emission, color, material
@@ -192,6 +194,7 @@ struct Hit
     int id;
     optix::float3 x;
     optix::float3 n;
+    optix::float2 uv;
 
     explicit operator bool() const {
         return t < inf();
@@ -202,12 +205,14 @@ inline Hit intersect(const Ray &r) {
     Hit hit;
     float count = sizeof(spheres) / sizeof(Sphere), d;
     optix::float3 x, n;
+    optix::float2 uv;
     for (int i = int(count); i--;) {
-        if ((d = spheres[i].intersect(r, x, n)) && d < hit.t) {
+        if ((d = spheres[i].intersect(r, x, n, uv)) && d < hit.t) {
             hit.t = d;
             hit.id = i;
             hit.x = x;
             hit.n = n;
+            hit.uv = uv;
         }
     }
     return hit;
@@ -221,15 +226,16 @@ optix::float3 radiance(const Ray &r, int depth, std::mt19937 & generator)
 
     const Sphere &obj = spheres[hit.id];        // the hit object
 
-    optix::float3 x = hit.x;
+    optix::float3 x = hit.x + 0.01 * hit.n;
     optix::float3 n = hit.n;
-    optix::float3 nl = dot(n, r.d) < 0 ? n : n*-1, f = obj.c;
+    optix::float3 nl = dot(n, r.d) < 0 ? n : n*-1;
+    optix::float3 f = obj.c;
 
     float p = f.x > f.y && f.x > f.z ? f.x : f.y > f.z ? f.y : f.z; // max refl
 
     if (++depth > 5) 
     {
-        if (rand_float(generator) < p && depth < 32) {
+        if (rand_float(generator) < p && depth < 1) {
             f = f*(1 / p);
         }
         else {
@@ -263,8 +269,8 @@ int main(int argc, char *argv[]) {
 
     fprintf(stderr, "Starting rendering\n");
 
-    const int w = 512;
-    const int h = 512;
+    const int w = 256;
+    const int h = 256;
     const int samps = argc == 2 ? atoi(argv[1]) / 4 : 1; // # samples
     const Ray cam(make_float3(50, 52, 295.6), normalize(make_float3(0, -0.042612, -1))); // cam pos, dir
     const optix::float3 cx = make_float3(w*.5135 / h), cy = normalize(cross(cx, cam.d))*.5135;
