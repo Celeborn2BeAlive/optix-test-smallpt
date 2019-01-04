@@ -278,15 +278,6 @@ optix::float3 radiance_rec(const Ray &r, int depth, std::mt19937 & generator)
         radiance_rec(reflRay, depth, generator)*RP : radiance_rec(Ray(x, tdir), depth, generator)*TP) : (radiance_rec(reflRay, depth, generator)*Re + radiance_rec(Ray(x, tdir), depth, generator)*Tr));
 }
 
-struct PathContrib
-{
-    uint32_t pixelIdx;
-    uint32_t pathIdx;
-    optix::float3 weight;
-    Ray currentRay;
-    uint32_t depth;
-};
-
 struct SampleIndex
 {
     // Pixel containing the sample
@@ -302,6 +293,8 @@ struct SampleIndex
     size_t indexInImage;
     size_t indexInPixel;
     size_t indexInGroup;
+
+    SampleIndex() = default;
 
     SampleIndex(
         size_t pixelIdx,
@@ -319,6 +312,14 @@ struct SampleIndex
     {}
 };
 
+struct PathContrib
+{
+    size_t pixelIdx;
+    optix::float3 weight;
+    Ray currentRay;
+    uint32_t depth;
+};
+
 int main(int argc, char *argv[]) {
     const auto start = hr_clock::now();
 
@@ -330,18 +331,18 @@ int main(int argc, char *argv[]) {
     const Ray cam(make_float3(50, 52, 295.6), normalize(make_float3(0, -0.042612, -1))); // cam pos, dir
     const auto cx = make_float3(w*.5135 / h);
     const auto cy = normalize(cross(cx, cam.d))*.5135;
-    
     const auto threadCount = shn::getSystemThreadCount() - 2;
+    const auto pixelCount = w * h;
+    std::vector<optix::float3> c(pixelCount, make_float3());
 
-    std::vector<PathContrib> pathBuffer;
     const int jitterSize = 2;
-    pathBuffer.resize(h * w * jitterSize * jitterSize * samps);
+    const auto sampleCountPerPixel = jitterSize * jitterSize * samps;
 
     const auto foreachSampleInRow = [&](auto rowIdx, auto functor)
     {
         for (size_t colIdx = 0; colIdx < w; ++colIdx)
         {
-            const auto pixelIdx = (h - rowIdx - 1) * w + colIdx;
+            const auto pixelIdx = rowIdx * w + colIdx;
             for (size_t sy = 0; sy < jitterSize; ++sy)
             {
                 for (size_t sx = 0; sx < jitterSize; ++sx)
@@ -350,7 +351,7 @@ int main(int argc, char *argv[]) {
                     for (size_t s = 0; s < samps; ++s)
                     {
                         const auto indexInPixel = groupIdx * samps + s;
-                        const auto indexInImage = pixelIdx * jitterSize * jitterSize * samps + indexInPixel;
+                        const auto indexInImage = pixelIdx * sampleCountPerPixel + indexInPixel;
 
                         functor(SampleIndex{ pixelIdx, colIdx, rowIdx, groupIdx, sx, sy, indexInImage, indexInPixel, s });
                     }
@@ -359,11 +360,15 @@ int main(int argc, char *argv[]) {
         }
     };
 
-    shn::syncParallelLoop(h, threadCount, [&](auto y, auto threadId) // Loop over image rows
+    std::atomic_uint pixelCounter = 0;
+    const auto renderFuture = shn::asyncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId) // Loop over image rows
     {
-        std::mt19937 generator{ uint32_t(y*y*y) };
+        std::mt19937 generator{ uint32_t(rowIdx * rowIdx * rowIdx) };
 
-        foreachSampleInRow(y, [&](SampleIndex sampleIndex)
+        std::vector<PathContrib> pathBuffer;
+        pathBuffer.resize(w * sampleCountPerPixel);
+
+        foreachSampleInRow(rowIdx, [&](SampleIndex sampleIndex)
         {
             const float r1 = 2 * rand_float(generator);
             const float dx = r1 < 1 ? sqrt(r1) - 1 : 1 - sqrt(2 - r1);
@@ -373,53 +378,38 @@ int main(int argc, char *argv[]) {
                 cy*(((sampleIndex.groupRow + .5 + dy) / jitterSize + sampleIndex.pixelRow) / h - .5) + cam.d;
             const Ray cameraRay(Ray(cam.o + d * 140, normalize(d))); // Camera rays are pushed forward to start in interior
 
-            auto & path = pathBuffer[sampleIndex.indexInImage];
+            auto & path = pathBuffer[sampleIndex.pixelColumn * sampleCountPerPixel + sampleIndex.indexInPixel];
             path.currentRay = cameraRay;
-            path.pathIdx = sampleIndex.indexInImage;
             path.pixelIdx = sampleIndex.pixelIdx;
             path.weight = optix::float3{ 1,1,1 };
             path.depth = 0;
         });
-    });
 
-    // What i want is:
-    // const auto cameraRays = await(sampleCameraRays())
-    // sampleCameraRays returns future<std::vector<Ray>>
-
-    const auto pixelCount = w * h;
-    std::vector<optix::float3> c(pixelCount, make_float3());
-    std::vector<std::mt19937> generators(pixelCount);
-    shn::syncParallelLoop(pixelCount, threadCount, [&](auto pixelIdx, auto threadId)
-    {
-        generators[pixelIdx].seed(uint32_t(pixelIdx) * 12345);
-    });
-
-    // #todo
-    // change loop to asyncParallelRun, to keep control over threads
-    // Each thread process samples of a pixel
-    // At each iteration call radiance on each path, which generate another pathBuffer
-    // The processing ends when no more paths are generated
-
-
-
-    std::atomic_uint pixelCounter = 0;
-    const auto renderFuture = shn::asyncParallelLoop(pixelCount, threadCount, [&](auto pixelIdx, auto threadId)
-    {
-        auto & generator = generators[pixelIdx];
-        const auto pathOffset = pixelIdx * jitterSize * jitterSize * samps;
-        optix::float3 r = make_float3();
-        for (auto pathIdx = pathOffset; pathIdx < pathBuffer.size() && pathBuffer[pathIdx].pixelIdx == pixelIdx; ++pathIdx)
+        for (size_t sIdx = 0, count = sampleCountPerPixel * w; sIdx < count; ++sIdx)
         {
-            auto & path = pathBuffer[pathIdx];
-            r = r + radiance_rec(path.currentRay, path.depth, generator);
+            auto & path = pathBuffer[sIdx];
+            c[path.pixelIdx] += radiance_rec(path.currentRay, path.depth, generator);
         }
-        c[pixelIdx] = r / float(samps * jitterSize * jitterSize);
-        ++pixelCounter;
+
+        for (size_t colIdx = 0; colIdx < w; ++colIdx)
+        {
+            c[rowIdx * w + colIdx] /= sampleCountPerPixel;
+        }
+
+        pixelCounter += w;
     });
 
     while (renderFuture.wait_for(std::chrono::milliseconds(33)) != std::future_status::ready)
     {
         fprintf(stderr, "\rRendering (%d spp) %5.2f%%", samps * 4, 100. * pixelCounter / pixelCount);
+    }
+
+    for (size_t rowIdx = 0; rowIdx < h / 2; ++rowIdx)
+    {
+        for (size_t colIdx = 0; colIdx < w; ++colIdx)
+        {
+            std::swap(c[(h - rowIdx - 1) * w + colIdx], c[rowIdx * w + colIdx]);
+        }
     }
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(hr_clock::now() - start);
