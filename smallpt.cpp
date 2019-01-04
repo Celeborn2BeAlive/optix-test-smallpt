@@ -10,11 +10,6 @@
 
 using hr_clock = std::chrono::high_resolution_clock;
 
-std::uniform_real_distribution<float> distr(0.0, 1.0);
-float rand_float(std::mt19937 & generator) {
-    return distr(generator);
-}
-
 inline optix::float3 make_float3(float x = 0.f, float y = 0.f, float z = 0.f)
 {
     return optix::float3{ x, y, z };
@@ -171,20 +166,21 @@ struct Sphere {
     }
 
     float intersect(const Ray &r, optix::float3 & x, optix::float3 & n, optix::float2 & uv) const {
-        return intersectMesh(r, x, n, uv);
+        return intersectAnalytic(r, x, n, uv);
     }
 };
 Sphere spheres[] = {//Scene: radius, position, emission, color, material
-    Sphere(10, make_float3(50, 40.8, 81.6), make_float3(),make_float3(.75,.25,.25),DIFF),
-  //Sphere(1e5, Vec(1e5 + 1,40.8,81.6), Vec(),Vec(.75,.25,.25),DIFF),//Left
-  //Sphere(1e5, Vec(-1e5 + 99,40.8,81.6),Vec(),Vec(.25,.25,.75),DIFF),//Rght
-  //Sphere(1e5, Vec(50,40.8, 1e5),     Vec(),Vec(.75,.75,.75),DIFF),//Back
-  //Sphere(1e5, Vec(50,40.8,-1e5 + 170), Vec(),Vec(),           DIFF),//Frnt
-  //Sphere(1e5, Vec(50, 1e5, 81.6),    Vec(),Vec(.75,.75,.75),DIFF),//Botm
-  //Sphere(1e5, Vec(50,-1e5 + 81.6,81.6),Vec(),Vec(.75,.75,.75),DIFF),//Top
-  //Sphere(16.5,Vec(27,16.5,47),       Vec(),Vec(1,1,1)*.999, SPEC),//Mirr
-  //Sphere(16.5,Vec(73,16.5,78),       Vec(),Vec(1,1,1)*.999, REFR),//Glas
-  Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(1,1,1),  make_float3(), DIFF) //Lite
+   //Sphere(10, make_float3(50, 40.8, 81.6), make_float3(),make_float3(.75,.25,.25),DIFF),
+  Sphere(1e5, make_float3(1e5 + 1,40.8,81.6), make_float3(),make_float3(.75,.25,.25),DIFF),//Left
+  Sphere(1e5, make_float3(-1e5 + 99,40.8,81.6),make_float3(),make_float3(.25,.25,.75),DIFF),//Rght
+  Sphere(1e5, make_float3(50,40.8, 1e5),     make_float3(),make_float3(.75,.75,.75),DIFF),//Back
+  Sphere(1e5, make_float3(50,40.8,-1e5 + 170), make_float3(),make_float3(),           DIFF),//Frnt
+  Sphere(1e5, make_float3(50, 1e5, 81.6),    make_float3(),make_float3(.75,.75,.75),DIFF),//Botm
+  Sphere(1e5, make_float3(50,-1e5 + 81.6,81.6),make_float3(),make_float3(.75,.75,.75),DIFF),//Top
+  Sphere(16.5,make_float3(27,16.5,47),       make_float3(),make_float3(1,1,1)*.999, SPEC),//Mirr
+  Sphere(16.5,make_float3(73,16.5,78),       make_float3(),make_float3(1,1,1)*.999, REFR),//Glas
+  Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(1,1,1),  make_float3(), DIFF)
+  //Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(1,1,1),  make_float3(), DIFF) //Lite
 };
 
 inline float clamp(float x) { return x < 0 ? 0 : x>1 ? 1 : x; }
@@ -220,62 +216,6 @@ inline Hit intersect(const Ray &r) {
         }
     }
     return hit;
-}
-
-optix::float3 radiance_rec(const Ray &r, int depth, std::mt19937 & generator) 
-{
-    const auto hit = intersect(r);
-
-    if (!hit) return make_float3(); // if miss, return black
-
-    const Sphere &obj = spheres[hit.id];        // the hit object
-
-    optix::float3 x = hit.x + 0.01 * hit.n;
-    optix::float3 n = hit.n;
-    optix::float3 nl = dot(n, r.d) < 0 ? n : n*-1;
-    optix::float3 f = obj.c;
-
-    float p = f.x > f.y && f.x > f.z ? f.x : f.y > f.z ? f.y : f.z; // max refl
-
-    if (++depth > 5) 
-    {
-        if (rand_float(generator) < p && depth < 1) {
-            f = f*(1 / p);
-        }
-        else {
-            return obj.e; //R.R.
-        }
-    }
-
-    if (obj.refl == DIFF) {                  // Ideal DIFFUSE reflection
-        float r1 = 2 * M_PI*rand_float(generator), r2 = rand_float(generator), r2s = sqrt(r2);
-        optix::float3 w = nl, u = normalize(cross((fabs(w.x) > .1 ? make_float3(0, 1) : make_float3(1)), w)), v = cross(w, u);
-        optix::float3 d = normalize(u*cos(r1)*r2s + v*sin(r1)*r2s + w*sqrt(1 - r2));
-        return obj.e + f * radiance_rec(Ray(x, d), depth, generator);
-    }
-
-    if (obj.refl == SPEC)            // Ideal SPECULAR reflection
-        return obj.e + f * radiance_rec(Ray(x, r.d - n * 2 * dot(n, r.d)), depth, generator);
-
-    Ray reflRay(x, r.d - n * 2 * dot(n, r.d));     // Ideal dielectric REFRACTION
-
-    bool into = dot(n, nl) > 0;                // Ray from outside going in?
-    float nc = 1;
-    float nt = 1.5;
-    float nnt = into ? nc / nt : nt / nc;
-    float ddn = dot(r.d, nl);
-    float cos2t;
-
-    if ((cos2t = 1 - nnt*nnt*(1 - ddn*ddn)) < 0)    // Total internal reflection
-        return obj.e + f * radiance_rec(reflRay, depth, generator);
-
-    optix::float3 tdir = normalize(r.d*nnt - n*((into ? 1 : -1)*(ddn*nnt + sqrt(cos2t))));
-
-    float a = nt - nc, b = nt + nc, R0 = a*a / (b*b), c = 1 - (into ? -ddn : dot(tdir, n));
-    float Re = R0 + (1 - R0)*c*c*c*c*c, Tr = 1 - Re, P = .25 + .5*Re, RP = Re / P, TP = Tr / (1 - P);
-
-    return obj.e + f * (depth > 2 ? (rand_float(generator) < P ?   // Russian roulette
-        radiance_rec(reflRay, depth, generator)*RP : radiance_rec(Ray(x, tdir), depth, generator)*TP) : (radiance_rec(reflRay, depth, generator)*Re + radiance_rec(Ray(x, tdir), depth, generator)*Tr));
 }
 
 struct SampleIndex
@@ -318,7 +258,18 @@ struct PathContrib
     optix::float3 weight;
     Ray currentRay;
     uint32_t depth;
+
+    PathContrib() = default;
+
+    PathContrib(size_t pixelIdx, optix::float3 weight, Ray currentRay, uint32_t depth):
+        pixelIdx{ pixelIdx }, weight(weight), currentRay{ currentRay }, depth{ depth }
+    {}
 };
+
+PathContrib extend(PathContrib path, const Ray & newRay, const optix::float3 & weightFactor)
+{
+    return{ path.pixelIdx, path.weight * weightFactor, newRay, path.depth + 1 };
+}
 
 int main(int argc, char *argv[]) {
     const auto start = hr_clock::now();
@@ -327,7 +278,7 @@ int main(int argc, char *argv[]) {
 
     const int w = 256;
     const int h = 256;
-    const int samps = argc == 2 ? atoi(argv[1]) / 4 : 1; // # samples
+    const int samps = argc == 2 ? atoi(argv[1]) / 4 : 32; // # samples
     const Ray cam(make_float3(50, 52, 295.6), normalize(make_float3(0, -0.042612, -1))); // cam pos, dir
     const auto cx = make_float3(w*.5135 / h);
     const auto cy = normalize(cross(cx, cam.d))*.5135;
@@ -337,6 +288,8 @@ int main(int argc, char *argv[]) {
 
     const int jitterSize = 2;
     const auto sampleCountPerPixel = jitterSize * jitterSize * samps;
+
+    std::uniform_real_distribution<float> randFloat(0.0, 1.0);
 
     const auto foreachSampleInRow = [&](auto rowIdx, auto functor)
     {
@@ -365,14 +318,14 @@ int main(int argc, char *argv[]) {
     {
         std::mt19937 generator{ uint32_t(rowIdx * rowIdx * rowIdx) };
 
-        std::vector<PathContrib> pathBuffer;
-        pathBuffer.resize(w * sampleCountPerPixel);
+        std::vector<PathContrib> pathBuffer(w * sampleCountPerPixel);
 
+        // Sample all camera rays to init paths
         foreachSampleInRow(rowIdx, [&](SampleIndex sampleIndex)
         {
-            const float r1 = 2 * rand_float(generator);
+            const float r1 = 2 * randFloat(generator);
             const float dx = r1 < 1 ? sqrt(r1) - 1 : 1 - sqrt(2 - r1);
-            const float r2 = 2 * rand_float(generator);
+            const float r2 = 2 * randFloat(generator);
             const float dy = r2 < 1 ? sqrt(r2) - 1 : 1 - sqrt(2 - r2);
             const optix::float3 d = cx*(((sampleIndex.groupColumn + .5 + dx) / jitterSize + sampleIndex.pixelColumn) / w - .5) +
                 cy*(((sampleIndex.groupRow + .5 + dy) / jitterSize + sampleIndex.pixelRow) / h - .5) + cam.d;
@@ -385,12 +338,117 @@ int main(int argc, char *argv[]) {
             path.depth = 0;
         });
 
-        for (size_t sIdx = 0, count = sampleCountPerPixel * w; sIdx < count; ++sIdx)
-        {
-            auto & path = pathBuffer[sIdx];
-            c[path.pixelIdx] += radiance_rec(path.currentRay, path.depth, generator);
-        }
+        std::vector<PathContrib> swapPathBuffer(w * sampleCountPerPixel);
 
+        auto pathCount = pathBuffer.size();
+
+        while (pathCount > 0)
+        {
+            size_t currentNextPathIdx = 0;
+            for (size_t pathIdx = 0; pathIdx < pathCount; ++pathIdx)
+            {
+                auto & path = pathBuffer[pathIdx];
+
+                const auto & r = path.currentRay;
+                const auto depth = path.depth;
+                const auto pixelIdx = path.pixelIdx;
+
+                const auto hit = intersect(r);
+
+                if (!hit) continue; // Here we could accumulate path.weight * envContrib
+
+                const Sphere &obj = spheres[hit.id];
+
+                optix::float3 x = hit.x + 0.02 * hit.n;
+                optix::float3 n = hit.n;
+                optix::float3 nl = dot(n, r.d) < 0 ? n : n*-1;
+                optix::float3 f = obj.c;
+
+                const float p = optix::max(optix::max(f.x, f.y), f.z);
+
+                c[pixelIdx] += path.weight * obj.e;
+
+                // russian roulette to kill paths after too much bounces
+                if (depth > 5)
+                {
+                    if (randFloat(generator) < p)
+                    {
+                        f *= (1 / p);
+                    }
+                    else
+                    {
+                        continue;
+                    }
+                }
+
+                // Maximum number of times the path can split
+                const auto splitCount = obj.refl != REFR ? 1 : (depth <= 2) ? 2 : 1;
+
+                if (currentNextPathIdx + (splitCount - 1) >= swapPathBuffer.size())
+                    swapPathBuffer.resize(swapPathBuffer.size() * 2);
+
+                if (obj.refl == DIFF)
+                {
+                    float r1 = 2 * M_PI*randFloat(generator), r2 = randFloat(generator), r2s = sqrt(r2);
+                    optix::float3 w = nl, u = normalize(cross((fabs(w.x) > .1 ? make_float3(0, 1) : make_float3(1)), w)), v = cross(w, u);
+                    optix::float3 d = normalize(u*cos(r1)*r2s + v*sin(r1)*r2s + w*sqrt(1 - r2));
+
+                    swapPathBuffer[currentNextPathIdx++] = extend(path, Ray(x, d), f);
+                    continue;
+                }
+
+                const Ray reflRay(x, r.d - n * 2 * dot(n, r.d));
+                if (obj.refl == SPEC)
+                {
+                    swapPathBuffer[currentNextPathIdx++] = extend(path, reflRay, f);
+                    continue;
+                }
+
+                const bool into = dot(n, nl) > 0;                // Ray from outside going in?
+                const float nc = 1;
+                const float nt = 1.5;
+                const float nnt = into ? nc / nt : nt / nc;
+                const float ddn = dot(r.d, nl);
+                const float cos2t = 1 - nnt * nnt * (1 - ddn * ddn);
+
+                if (cos2t < 0)
+                {
+                    swapPathBuffer[currentNextPathIdx++] = extend(path, reflRay, f);
+                    continue;
+                }
+
+                const optix::float3 tdir = normalize(r.d*nnt - n*((into ? 1 : -1)*(ddn * nnt + sqrt(cos2t))));
+
+                const float a = nt - nc;
+                const float b = nt + nc;
+                const float R0 = a * a / (b * b);
+                const float c = 1 - (into ? -ddn : dot(tdir, n));
+                const float c2 = c * c;
+                const float Re = R0 + (1 - R0) * c2 * c2 * c;
+                const float Tr = 1 - Re;
+                
+                if (depth <= 2)
+                {
+                    // Split before two bounces
+                    swapPathBuffer[currentNextPathIdx++] = extend(path, reflRay, f * Re);
+                    swapPathBuffer[currentNextPathIdx++] = extend(path, Ray(x, tdir), f * Tr);
+                    continue;
+                }
+
+                const float P = .25 + .5 * Re;
+                if (randFloat(generator) < P)
+                {
+                    swapPathBuffer[currentNextPathIdx++] = extend(path, reflRay, f * Re / P);
+                    continue;
+                }
+
+                swapPathBuffer[currentNextPathIdx++] = extend(path, Ray(x, tdir), f * Tr / (1.f - P));
+            }
+        
+            pathCount = currentNextPathIdx;
+            std::swap(pathBuffer, swapPathBuffer);
+        }
+        
         for (size_t colIdx = 0; colIdx < w; ++colIdx)
         {
             c[rowIdx * w + colIdx] /= sampleCountPerPixel;
