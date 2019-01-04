@@ -287,6 +287,37 @@ struct PathContrib
     uint32_t depth;
 };
 
+struct SampleIndex
+{
+    // Pixel containing the sample
+    size_t pixelIdx;
+    size_t pixelColumn; // x coordinate
+    size_t pixelRow; // y coordinate
+    // Group containing the sample; Each pixel is split in multiple disjoint cells
+    // due to jittering; Each cells has a group of samples
+    size_t groupIdx;
+    size_t groupColumn;
+    size_t groupRow;
+    // Indices of the sample relative to containers
+    size_t indexInImage;
+    size_t indexInPixel;
+    size_t indexInGroup;
+
+    SampleIndex(
+        size_t pixelIdx,
+        size_t pixelColumn,
+        size_t pixelRow,
+        size_t groupIdx,
+        size_t groupColumn,
+        size_t groupRow,
+        size_t indexInImage,
+        size_t indexInPixel,
+        size_t indexInGroup) : 
+        pixelIdx{ pixelIdx }, pixelColumn{ pixelColumn }, pixelRow{ pixelRow },
+        groupIdx{ groupIdx }, groupColumn{ groupColumn }, groupRow{ groupRow },
+        indexInImage{ indexInImage }, indexInPixel{ indexInPixel }, indexInGroup{ indexInGroup }
+    {}
+};
 
 int main(int argc, char *argv[]) {
     const auto start = hr_clock::now();
@@ -297,7 +328,8 @@ int main(int argc, char *argv[]) {
     const int h = 256;
     const int samps = argc == 2 ? atoi(argv[1]) / 4 : 1; // # samples
     const Ray cam(make_float3(50, 52, 295.6), normalize(make_float3(0, -0.042612, -1))); // cam pos, dir
-    const optix::float3 cx = make_float3(w*.5135 / h), cy = normalize(cross(cx, cam.d))*.5135;
+    const auto cx = make_float3(w*.5135 / h);
+    const auto cy = normalize(cross(cx, cam.d))*.5135;
     
     const auto threadCount = shn::getSystemThreadCount() - 2;
 
@@ -305,33 +337,49 @@ int main(int argc, char *argv[]) {
     const int jitterSize = 2;
     pathBuffer.resize(h * w * jitterSize * jitterSize * samps);
 
-    shn::syncParallelLoop(h, threadCount, [&](auto y, auto threadId) // Loop over image rows
+    const auto foreachSampleInRow = [&](auto rowIdx, auto functor)
     {
-        std::mt19937 generator{ uint32_t(y*y*y) };
-        for (unsigned short x = 0; x < w; x++) {   // Loop cols
-            const int pixelIdx = (h - y - 1)*w + x;
-            for (int sy = 0; sy < jitterSize; sy++) {     // 2x2 subpixel rows
-                for (int sx = 0; sx < jitterSize; sx++) {        // 2x2 subpixel cols
-                    const int jitterIdx = sx + sy * jitterSize;
-                    optix::float3 r = make_float3();
-                    for (int s = 0; s < samps; s++) {
-                        float r1 = 2 * rand_float(generator), dx = r1 < 1 ? sqrt(r1) - 1 : 1 - sqrt(2 - r1);
-                        float r2 = 2 * rand_float(generator), dy = r2 < 1 ? sqrt(r2) - 1 : 1 - sqrt(2 - r2);
-                        optix::float3 d = cx*(((sx + .5 + dx) / 2 + x) / w - .5) +
-                            cy*(((sy + .5 + dy) / 2 + y) / h - .5) + cam.d;
-                        const Ray cameraRay(Ray(cam.o + d * 140, normalize(d))); // Camera rays are pushed forward to start in interior
+        for (size_t colIdx = 0; colIdx < w; ++colIdx)
+        {
+            const auto pixelIdx = (h - rowIdx - 1) * w + colIdx;
+            for (size_t sy = 0; sy < jitterSize; ++sy)
+            {
+                for (size_t sx = 0; sx < jitterSize; ++sx)
+                {
+                    const auto groupIdx = sy * jitterSize + sx;
+                    for (size_t s = 0; s < samps; ++s)
+                    {
+                        const auto indexInPixel = groupIdx * samps + s;
+                        const auto indexInImage = pixelIdx * jitterSize * jitterSize * samps + indexInPixel;
 
-                        const auto pathIdx = pixelIdx * jitterSize * jitterSize * samps + jitterIdx * samps + s;
-                        auto & path = pathBuffer[pathIdx];
-                        path.currentRay = cameraRay;
-                        path.pathIdx = pathIdx;
-                        path.pixelIdx = pixelIdx;
-                        path.weight = optix::float3{ 1,1,1 };
-                        path.depth = 0;
+                        functor(SampleIndex{ pixelIdx, colIdx, rowIdx, groupIdx, sx, sy, indexInImage, indexInPixel, s });
                     }
                 }
             }
         }
+    };
+
+    shn::syncParallelLoop(h, threadCount, [&](auto y, auto threadId) // Loop over image rows
+    {
+        std::mt19937 generator{ uint32_t(y*y*y) };
+
+        foreachSampleInRow(y, [&](SampleIndex sampleIndex)
+        {
+            const float r1 = 2 * rand_float(generator);
+            const float dx = r1 < 1 ? sqrt(r1) - 1 : 1 - sqrt(2 - r1);
+            const float r2 = 2 * rand_float(generator);
+            const float dy = r2 < 1 ? sqrt(r2) - 1 : 1 - sqrt(2 - r2);
+            const optix::float3 d = cx*(((sampleIndex.groupColumn + .5 + dx) / jitterSize + sampleIndex.pixelColumn) / w - .5) +
+                cy*(((sampleIndex.groupRow + .5 + dy) / jitterSize + sampleIndex.pixelRow) / h - .5) + cam.d;
+            const Ray cameraRay(Ray(cam.o + d * 140, normalize(d))); // Camera rays are pushed forward to start in interior
+
+            auto & path = pathBuffer[sampleIndex.indexInImage];
+            path.currentRay = cameraRay;
+            path.pathIdx = sampleIndex.indexInImage;
+            path.pixelIdx = sampleIndex.pixelIdx;
+            path.weight = optix::float3{ 1,1,1 };
+            path.depth = 0;
+        });
     });
 
     // What i want is:
@@ -351,6 +399,8 @@ int main(int argc, char *argv[]) {
     // Each thread process samples of a pixel
     // At each iteration call radiance on each path, which generate another pathBuffer
     // The processing ends when no more paths are generated
+
+
 
     std::atomic_uint pixelCounter = 0;
     const auto renderFuture = shn::asyncParallelLoop(pixelCount, threadCount, [&](auto pixelIdx, auto threadId)
