@@ -3,6 +3,7 @@
 #include <stdio.h>  //        Remove "-fopenmp" for g++ version < 4.2
 #include <random>
 #include <chrono>
+#include <numeric>
 
 #include <optixu/optixu_math_namespace.h>
 #include <optix_prime/optix_prime.h>
@@ -76,8 +77,12 @@ TriMesh makeSphereTriMesh(const optix::float3 origin, float radius, const uint32
 
 struct TriangleHit
 {
-    float distance;
+    float dist = -1.f;
     float u, v;
+
+    TriangleHit() = default;
+
+    TriangleHit(float d, float u, float v) : dist{ d }, u{ u }, v{ v } {}
 };
 
 // triangle degined by vertices v0, v1 and  v2
@@ -102,7 +107,51 @@ TriangleHit triIntersect(optix::float3 ro, optix::float3 rd, optix::float3 v0, o
     return { t, u, v };
 }
 
-float intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & mesh, optix::float3 & x, optix::float3 & n, optix::float2 & uv)
+struct Hit
+{
+    static inline float inf() { return 1e20; };
+    float dist = inf();
+    uint32_t instId;
+    optix::float3 x;
+    optix::float3 n;
+    optix::float2 uv;
+
+    explicit operator bool() const {
+        return dist < inf();
+    }
+};
+
+struct MeshHit : public TriangleHit
+{
+    uint32_t triId;
+
+    MeshHit() = default;
+    MeshHit(TriangleHit h, uint32_t triId) : TriangleHit{ h }, triId{ triId } {}
+};
+
+// Convert a mesh hit to a generic hit
+Hit makeHit(uint32_t instId, const TriMesh & mesh, const MeshHit & meshHit)
+{
+    Hit hit;
+    hit.dist = meshHit.dist;
+    hit.instId = instId;
+
+    const auto u = meshHit.u;
+    const auto v = meshHit.v;
+    const auto w = 1.f - u - v;
+
+    const auto i1 = mesh.indexBuffer[meshHit.triId];
+    const auto i2 = mesh.indexBuffer[meshHit.triId + 1];
+    const auto i3 = mesh.indexBuffer[meshHit.triId + 2];
+
+    hit.x = w * mesh.positionBuffer[i1] + u * mesh.positionBuffer[i2] + v * mesh.positionBuffer[i3];
+    hit.n = w * mesh.normalBuffer[i1] + u * mesh.normalBuffer[i2] + v * mesh.normalBuffer[i3];
+    hit.uv = optix::make_float2(u, v);
+
+    return hit;
+}
+
+MeshHit intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & mesh)
 {
     auto minDistance = std::numeric_limits<float>::max();
     uint32_t minIdx;
@@ -112,25 +161,17 @@ float intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh & 
         const auto i2 = mesh.indexBuffer[i + 1];
         const auto i3 = mesh.indexBuffer[i + 2];
         const auto hit = triIntersect(ro, rd, mesh.positionBuffer[i1], mesh.positionBuffer[i2], mesh.positionBuffer[i3]);
-        if (hit.distance > 0 && hit.distance < minDistance) {
-            minDistance = hit.distance;
+        if (hit.dist > 0 && hit.dist < minDistance) {
+            minDistance = hit.dist;
             minIdx = i;
             minHit = hit;
         }
     }
 
     if (minDistance <= 0.f || minDistance == std::numeric_limits<float>::max())
-        return 0.f;
+        return{};
 
-    x = ro + minDistance * rd;
-    const auto i1 = mesh.indexBuffer[minIdx];
-    const auto i2 = mesh.indexBuffer[minIdx + 1];
-    const auto i3 = mesh.indexBuffer[minIdx + 2];
-
-    n = (1 - minHit.u - minHit.v) * mesh.normalBuffer[i1] + minHit.u * mesh.normalBuffer[i2] + minHit.v * mesh.normalBuffer[i3];
-    uv = optix::float2{ minHit.u, minHit.v };
-
-    return minDistance;
+    return { minHit, minIdx };
 }
 
 struct Ray { 
@@ -151,25 +192,48 @@ struct Sphere {
     Sphere(float rad_, optix::float3 p_, optix::float3 e_, optix::float3 c_, Refl_t refl_) :
         rad(rad_), p(p_), e(e_), c(c_), refl(refl_), mesh{makeSphereTriMesh(p_, rad_)} {}
 
-    float intersectAnalytic(const Ray &r, optix::float3 & x, optix::float3 & n, optix::float2 & uv) const { // returns distance, 0 if nohit
+    struct SphereHit
+    {
+        float dist = -1.f;
+        optix::float3 x;
+
+        SphereHit() = default;
+        SphereHit(float d, optix::float3 x) : dist{ d }, x(x) {}
+    };
+
+    Hit makeHit(uint32_t instId, const SphereHit & sphereHit)
+    {
+        Hit hit;
+        hit.dist = sphereHit.dist;
+        hit.instId = instId;
+        hit.x = sphereHit.x;
+        hit.n = optix::normalize(hit.x - p);
+        hit.uv = optix::float2{ 0.f, 0.f };
+        return hit;
+    }
+
+    Hit makeHit(uint32_t instId, const MeshHit & meshHit)
+    {
+        return ::makeHit(instId, mesh, meshHit);
+    }
+
+    SphereHit intersectAnalytic(const Ray &r) const { // returns distance, 0 if nohit
         optix::float3 op = p - r.o; // Solve t^2*d.d + 2*t*(o-p).d + (o-p).(o-p)-R^2 = 0
         float t, eps = 1e-4, b = dot(op, r.d), det = b*b - dot(op, op) + rad*rad;
-        if (det < 0) return 0; else det = sqrt(det);
+        if (det < 0) return{}; else det = sqrt(det);
         const auto dist = (t = b - det) > eps ? t : ((t = b + det) > eps ? t : 0);
         if (dist > 0) {
-            x = r.o + r.d*dist;
-            n = optix::normalize(x - p);
-            uv = optix::float2{0.f, 0.f};
+            return{ dist, r.o + r.d*dist };
         }
-        return dist;
+        return{};
     }
 
-    float intersectMesh(const Ray &r, optix::float3 & x, optix::float3 & n, optix::float2 & uv) const {
-        return ::intersect(r.o, r.d, mesh, x, n, uv);
+    MeshHit intersectMesh(const Ray &r) const {
+        return ::intersect(r.o, r.d, mesh);
     }
 
-    float intersect(const Ray &r, optix::float3 & x, optix::float3 & n, optix::float2 & uv) const {
-        return intersectMesh(r, x, n, uv);
+    auto intersect(const Ray &r) const {
+        return intersectMesh(r);
     }
 };
 
@@ -198,35 +262,23 @@ inline float clamp(float x) { return x < 0 ? 0 : x>1 ? 1 : x; }
 
 inline int toInt(float x) { return int(pow(clamp(x), 1 / 2.2) * 255 + .5); }
 
-struct Hit
-{
-    static inline float inf() { return 1e20; };
-    float t = inf();
-    int id;
-    optix::float3 x;
-    optix::float3 n;
-    optix::float2 uv;
-
-    explicit operator bool() const {
-        return t < inf();
-    }
-};
-
 inline Hit intersect(const Ray &r) {
-    Hit hit;
-    float count = sizeof(spheres) / sizeof(Sphere), d;
-    optix::float3 x, n;
-    optix::float2 uv;
-    for (int i = int(count); i--;) {
-        if ((d = spheres[i].intersect(r, x, n, uv)) && d < hit.t) {
-            hit.t = d;
-            hit.id = i;
-            hit.x = x;
-            hit.n = n;
-            hit.uv = uv;
+    using SceneHitT = decltype(spheres[0].intersect(r));
+    const size_t count = sizeof(spheres) / sizeof(Sphere);
+    SceneHitT nearestHit;
+    nearestHit.dist = Hit::inf();
+    size_t nearestInst;
+    for (size_t i = 0; i < count; ++i) {
+        const auto currentHit = spheres[i].intersect(r);
+        if (currentHit.dist > 0.f && currentHit.dist < nearestHit.dist) {
+            nearestHit = currentHit;
+            nearestInst = i;
         }
     }
-    return hit;
+    if (nearestHit.dist == Hit::inf())
+        return{};
+
+    return spheres[nearestInst].makeHit(nearestInst, nearestHit);
 }
 
 struct SampleIndex
@@ -301,6 +353,126 @@ void writeImage(int w, int h, const optix::float3 * c)
         fprintf(f, "%d %d %d ", toInt(c[i].x), toInt(c[i].y), toInt(c[i].z));
 }
 
+void cpuIntersect(const PathContrib * pathBuffer, size_t pathCount, Hit * hits)
+{
+    for (size_t pathIdx = 0; pathIdx < pathCount; ++pathIdx)
+    {
+        auto & path = pathBuffer[pathIdx];
+        const auto & r = path.currentRay;
+        hits[pathIdx] = intersect(r);
+    }
+}
+
+size_t shadePaths(const PathContrib * pathBuffer, size_t pathCount, const Hit * hitBuffer, std::vector<PathContrib> & nextPaths, optix::float3 * outColor, std::mt19937 & generator)
+{
+    const std::uniform_real_distribution<float> randFloat(0.0, 1.0);
+
+    size_t currentNextPathIdx = 0;
+    for (size_t pathIdx = 0; pathIdx < pathCount; ++pathIdx)
+    {
+        auto & path = pathBuffer[pathIdx];
+
+        const auto & r = path.currentRay;
+
+        const auto hit = hitBuffer[pathIdx];
+
+        if (!hit) continue; // Here we could accumulate path.weight * envContrib
+
+        const Sphere &obj = spheres[hit.instId];
+
+        optix::float3 x = hit.x + 0.02 * hit.n;
+        optix::float3 n = hit.n;
+        optix::float3 nl = dot(n, r.d) < 0 ? n : n*-1;
+        optix::float3 f = obj.c;
+
+        const float p = optix::max(optix::max(f.x, f.y), f.z);
+
+        outColor[path.pixelIdx] += path.weight * obj.e;
+
+        const auto depth = path.depth;
+
+        // russian roulette to kill paths after too much bounces
+        if (depth > 5)
+        {
+            if (randFloat(generator) < p)
+            {
+                f *= (1 / p);
+            }
+            else
+            {
+                continue;
+            }
+        }
+
+        // Maximum number of times the path can split
+        const auto splitCount = obj.refl != REFR ? 1 : (depth <= 2) ? 2 : 1;
+
+        if (currentNextPathIdx + (splitCount - 1) >= nextPaths.size())
+        {
+            nextPaths.resize(1 + nextPaths.size() * 2);
+        }
+
+        if (obj.refl == DIFF)
+        {
+            float r1 = 2 * M_PI*randFloat(generator), r2 = randFloat(generator), r2s = sqrt(r2);
+            optix::float3 w = nl, u = normalize(cross((fabs(w.x) > .1 ? make_float3(0, 1) : make_float3(1)), w)), v = cross(w, u);
+            optix::float3 d = normalize(u*cos(r1)*r2s + v*sin(r1)*r2s + w*sqrt(1 - r2));
+
+            nextPaths[currentNextPathIdx++] = extend(path, Ray(x, d), f);
+            continue;
+        }
+
+        const Ray reflRay(x, r.d - n * 2 * dot(n, r.d));
+        if (obj.refl == SPEC)
+        {
+            nextPaths[currentNextPathIdx++] = extend(path, reflRay, f);
+            continue;
+        }
+
+        const bool into = dot(n, nl) > 0;                // Ray from outside going in?
+        const float nc = 1;
+        const float nt = 1.5;
+        const float nnt = into ? nc / nt : nt / nc;
+        const float ddn = dot(r.d, nl);
+        const float cos2t = 1 - nnt * nnt * (1 - ddn * ddn);
+
+        if (cos2t < 0)
+        {
+            nextPaths[currentNextPathIdx++] = extend(path, reflRay, f);
+            continue;
+        }
+
+        const optix::float3 tdir = normalize(r.d*nnt - n*((into ? 1 : -1)*(ddn * nnt + sqrt(cos2t))));
+
+        const float a = nt - nc;
+        const float b = nt + nc;
+        const float R0 = a * a / (b * b);
+        const float c = 1 - (into ? -ddn : dot(tdir, n));
+        const float c2 = c * c;
+        const float Re = R0 + (1 - R0) * c2 * c2 * c;
+        const float Tr = 1 - Re;
+
+        if (depth <= 2)
+        {
+            // Split before two bounces
+            nextPaths[currentNextPathIdx++] = extend(path, reflRay, f * Re);
+            nextPaths[currentNextPathIdx++] = extend(path, Ray(x, tdir), f * Tr);
+            continue;
+        }
+
+        const float P = .25 + .5 * Re;
+        if (randFloat(generator) < P)
+        {
+            nextPaths[currentNextPathIdx++] = extend(path, reflRay, f * Re / P);
+            continue;
+        }
+
+        nextPaths[currentNextPathIdx++] = extend(path, Ray(x, tdir), f * Tr / (1.f - P));
+    }
+
+    return currentNextPathIdx;
+}
+
 int cpuRender(int argc, char *argv[]) {
     const auto start = hr_clock::now();
 
@@ -369,116 +541,19 @@ int cpuRender(int argc, char *argv[]) {
         });
 
         std::vector<PathContrib> swapPathBuffer(w * sampleCountPerPixel);
+        std::vector<Hit> hitBuffer(pathBuffer.size());
 
         auto pathCount = pathBuffer.size();
 
         while (pathCount > 0)
         {
-            size_t currentNextPathIdx = 0;
-            for (size_t pathIdx = 0; pathIdx < pathCount; ++pathIdx)
-            {
-                auto & path = pathBuffer[pathIdx];
+            hitBuffer.resize(pathCount);
+            cpuIntersect(pathBuffer.data(), pathCount, hitBuffer.data());
 
-                const auto & r = path.currentRay;
-                const auto depth = path.depth;
-                const auto pixelIdx = path.pixelIdx;
-
-                const auto hit = intersect(r);
-
-                if (!hit) continue; // Here we could accumulate path.weight * envContrib
-
-                const Sphere &obj = spheres[hit.id];
-
-                optix::float3 x = hit.x + 0.02 * hit.n;
-                optix::float3 n = hit.n;
-                optix::float3 nl = dot(n, r.d) < 0 ? n : n*-1;
-                optix::float3 f = obj.c;
-
-                const float p = optix::max(optix::max(f.x, f.y), f.z);
-
-                c[pixelIdx] += path.weight * obj.e;
-
-                // russian roulette to kill paths after too much bounces
-                if (depth > 5)
-                {
-                    if (randFloat(generator) < p)
-                    {
-                        f *= (1 / p);
-                    }
-                    else
-                    {
-                        continue;
-                    }
-                }
-
-                // Maximum number of times the path can split
-                const auto splitCount = obj.refl != REFR ? 1 : (depth <= 2) ? 2 : 1;
-
-                if (currentNextPathIdx + (splitCount - 1) >= swapPathBuffer.size())
-                    swapPathBuffer.resize(swapPathBuffer.size() * 2);
-
-                if (obj.refl == DIFF)
-                {
-                    float r1 = 2 * M_PI*randFloat(generator), r2 = randFloat(generator), r2s = sqrt(r2);
-                    optix::float3 w = nl, u = normalize(cross((fabs(w.x) > .1 ? make_float3(0, 1) : make_float3(1)), w)), v = cross(w, u);
-                    optix::float3 d = normalize(u*cos(r1)*r2s + v*sin(r1)*r2s + w*sqrt(1 - r2));
-
-                    swapPathBuffer[currentNextPathIdx++] = extend(path, Ray(x, d), f);
-                    continue;
-                }
-
-                const Ray reflRay(x, r.d - n * 2 * dot(n, r.d));
-                if (obj.refl == SPEC)
-                {
-                    swapPathBuffer[currentNextPathIdx++] = extend(path, reflRay, f);
-                    continue;
-                }
-
-                const bool into = dot(n, nl) > 0;                // Ray from outside going in?
-                const float nc = 1;
-                const float nt = 1.5;
-                const float nnt = into ? nc / nt : nt / nc;
-                const float ddn = dot(r.d, nl);
-                const float cos2t = 1 - nnt * nnt * (1 - ddn * ddn);
-
-                if (cos2t < 0)
-                {
-                    swapPathBuffer[currentNextPathIdx++] = extend(path, reflRay, f);
-                    continue;
-                }
-
-                const optix::float3 tdir = normalize(r.d*nnt - n*((into ? 1 : -1)*(ddn * nnt + sqrt(cos2t))));
-
-                const float a = nt - nc;
-                const float b = nt + nc;
-                const float R0 = a * a / (b * b);
-                const float c = 1 - (into ? -ddn : dot(tdir, n));
-                const float c2 = c * c;
-                const float Re = R0 + (1 - R0) * c2 * c2 * c;
-                const float Tr = 1 - Re;
-                
-                if (depth <= 2)
-                {
-                    // Split before two bounces
-                    swapPathBuffer[currentNextPathIdx++] = extend(path, reflRay, f * Re);
-                    swapPathBuffer[currentNextPathIdx++] = extend(path, Ray(x, tdir), f * Tr);
-                    continue;
-                }
-
-                const float P = .25 + .5 * Re;
-                if (randFloat(generator) < P)
-                {
-                    swapPathBuffer[currentNextPathIdx++] = extend(path, reflRay, f * Re / P);
-                    continue;
-                }
-
-                swapPathBuffer[currentNextPathIdx++] = extend(path, Ray(x, tdir), f * Tr / (1.f - P));
-            }
-        
-            pathCount = currentNextPathIdx;
+            pathCount = shadePaths(pathBuffer.data(), pathCount, hitBuffer.data(), swapPathBuffer, c.data(), generator);
             std::swap(pathBuffer, swapPathBuffer);
         }
-        
+
         for (size_t colIdx = 0; colIdx < w; ++colIdx)
         {
             c[rowIdx * w + colIdx] /= sampleCountPerPixel;
@@ -498,6 +573,8 @@ int cpuRender(int argc, char *argv[]) {
 
     flipY(w, h, c.data());
     writeImage(w, h, c.data());
+
+    return 0;
 }
 
 #define CHK_PRIME( code )                                                      \
@@ -534,6 +611,20 @@ struct OptixHit
     float u;
     float v;
 };
+
+std::vector<Hit> convertHits(const OptixHit * hits, size_t count, size_t threadCount)
+{
+    std::vector<Hit> newHits(count);
+    shn::syncParallelLoop(count, threadCount, [&](size_t i, size_t threadId)
+    {
+        if (hits[i].t <= 0.f)
+            return;
+
+        MeshHit meshHit{ TriangleHit{hits[i].t, hits[i].u, hits[i].v}, uint32_t(hits[i].triId) };
+        newHits[i] = spheres[hits[i].instId].makeHit(hits[i].instId, meshHit);
+    });
+    return newHits;
+}
 
 int main(int argc, char *argv[]) {
     RTPcontext context;
@@ -621,9 +712,10 @@ int main(int argc, char *argv[]) {
     };
 
     std::vector<std::mt19937> generators(h);
-    std::vector<OptixRay> rays(w * h * sampleCountPerPixel);
+    
     std::vector<PathContrib> pathBuffer(w * h * sampleCountPerPixel);
-    std::vector<PathContrib> swapPathBuffer(w * h * sampleCountPerPixel);
+    std::vector<size_t> pathOffsetPerRow(h);
+    std::vector<size_t> pathCountPerRow(h);
 
     shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId) // Loop over image rows
     {
@@ -642,49 +734,82 @@ int main(int argc, char *argv[]) {
                 cy*(((sampleIndex.groupRow + .5 + dy) / jitterSize + sampleIndex.pixelRow) / h - .5) + cam.d;
             const Ray cameraRay(Ray(cam.o + d * 140, normalize(d))); // Camera rays are pushed forward to start in interior
 
-            auto & optixRay = rays[sampleIndex.indexInImage];
-            optixRay.origin = cameraRay.o;
-            optixRay.tmin = 0;
-            optixRay.dir = cameraRay.d;
-            optixRay.tmax = Hit::inf();
-
             auto & path = pathBuffer[sampleIndex.indexInImage];
             path.currentRay = cameraRay;
             path.pixelIdx = sampleIndex.pixelIdx;
             path.weight = optix::float3{ 1,1,1 };
             path.depth = 0;
         });
+
+        pathOffsetPerRow[rowIdx] = sampleCountPerPixel * w * rowIdx;
+        pathCountPerRow[rowIdx] = sampleCountPerPixel * w;
     });
 
-    std::vector<OptixHit> hits(rays.size());
+    size_t pathCount = pathBuffer.size();
+    std::vector<std::vector<PathContrib>> nextPathsPerRow(h);
+    for (size_t rowIdx = 0; rowIdx < h; ++rowIdx)
+        nextPathsPerRow.resize(w * sampleCountPerPixel);
 
-    RTPbufferdesc raysDesc;
-    rtpBufferDescCreate(context, OptixRay::format, RTP_BUFFER_TYPE_HOST, rays.data(), &raysDesc);
-    rtpBufferDescSetRange(raysDesc, 0, rays.size());
+    while (pathCount > 0)
+    {
+        std::vector<OptixRay> optixRays(pathCount);
+        std::vector<OptixHit> optixHits(pathCount);
 
-    RTPbufferdesc hitsDesc;
-    rtpBufferDescCreate(context, OptixHit::format, RTP_BUFFER_TYPE_HOST, hits.data(), &hitsDesc);
-    rtpBufferDescSetRange(hitsDesc, 0, hits.size());
+        shn::syncParallelLoop(pathCount, threadCount, [&](auto pathIdx, auto threadId)
+        {
+            auto & optixRay = optixRays[pathIdx];
+            const auto & path = pathBuffer[pathIdx];
+            optixRay.origin = path.currentRay.o;
+            optixRay.tmin = 0;
+            optixRay.dir = path.currentRay.d;
+            optixRay.tmax = Hit::inf();
+        });
 
-    RTPquery query;
-    rtpQueryCreate(sceneModel, RTP_QUERY_TYPE_CLOSEST, &query);
-    rtpQuerySetRays(query, raysDesc);
-    rtpQuerySetHits(query, hitsDesc);
-    rtpQueryExecute(query, 0);
+        RTPbufferdesc raysDesc;
+        rtpBufferDescCreate(context, OptixRay::format, RTP_BUFFER_TYPE_HOST, optixRays.data(), &raysDesc);
+        rtpBufferDescSetRange(raysDesc, 0, optixRays.size());
+
+        RTPbufferdesc hitsDesc;
+        rtpBufferDescCreate(context, OptixHit::format, RTP_BUFFER_TYPE_HOST, optixHits.data(), &hitsDesc);
+        rtpBufferDescSetRange(hitsDesc, 0, optixHits.size());
+
+        RTPquery query;
+        rtpQueryCreate(sceneModel, RTP_QUERY_TYPE_CLOSEST, &query);
+        rtpQuerySetRays(query, raysDesc);
+        rtpQuerySetHits(query, hitsDesc);
+        rtpQueryExecute(query, 0);
+
+        const auto hits = convertHits(optixHits.data(), pathCount, threadCount);
+
+        shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId)
+        {
+            const auto pathOffset = pathOffsetPerRow[rowIdx];
+            const auto pathCount = pathCountPerRow[rowIdx];
+            if (!pathCount)
+                return;
+            pathCountPerRow[rowIdx] = shadePaths(&pathBuffer[pathOffset], pathCount, &hits[pathOffset], nextPathsPerRow[rowIdx], c.data(), generators[rowIdx]);
+        });
+
+        size_t totalPathCount = 0;
+        for (size_t rowIdx = 0; rowIdx < h; ++rowIdx)
+        {
+            pathOffsetPerRow[rowIdx] = totalPathCount;
+            totalPathCount += pathCountPerRow[rowIdx];
+        }
+
+        pathBuffer.resize(totalPathCount);
+        shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId)
+        {
+            const auto offset = pathOffsetPerRow[rowIdx];
+            const auto count = pathCountPerRow[rowIdx];
+            std::copy(begin(nextPathsPerRow[rowIdx]), begin(nextPathsPerRow[rowIdx]) + pathCountPerRow[rowIdx], begin(pathBuffer) + offset);
+        });
+
+        pathCount = totalPathCount;
+    }
 
     shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId) // Loop over image rows
     {
-        const auto pathOffset = rowIdx * w * sampleCountPerPixel;
-        const auto pathCount = w * sampleCountPerPixel;
-        for (size_t i = 0; i < pathCount; ++i)
-        {
-            const auto pathIdx = i + pathOffset;
-
-            const auto & path = pathBuffer[pathIdx];
-            if (hits[pathIdx].t > 0.0f)
-                c[path.pixelIdx] += optix::make_float3(1, 1, 1);
-        }
-
         for (size_t colIdx = 0; colIdx < w; ++colIdx)
         {
             c[rowIdx * w + colIdx] /= sampleCountPerPixel;
