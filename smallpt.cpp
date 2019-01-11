@@ -5,6 +5,7 @@
 #include <chrono>
 
 #include <optixu/optixu_math_namespace.h>
+#include <optix_prime/optix_prime.h>
 
 #include "ThreadUtils.h"
 
@@ -137,7 +138,9 @@ struct Ray {
     Ray() = default;
     Ray(optix::float3 o_, optix::float3 d_) : o(o_), d(d_) {} 
 };
+
 enum Refl_t { DIFF, SPEC, REFR };  // material types, used in radiance()
+
 struct Sphere {
     float rad;       // radius
     optix::float3 p, e, c;      // position, emission, color
@@ -188,6 +191,8 @@ Sphere spheres[] = {
 //  Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(1,1,1),  make_float3(), DIFF)
 //  //Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(1,1,1),  make_float3(), DIFF) //Lite
 //};
+
+const size_t sphereCount = sizeof(spheres) / sizeof(spheres[0]);
 
 inline float clamp(float x) { return x < 0 ? 0 : x>1 ? 1 : x; }
 
@@ -277,7 +282,26 @@ PathContrib extend(PathContrib path, const Ray & newRay, const optix::float3 & w
     return{ path.pixelIdx, path.weight * weightFactor, newRay, path.depth + 1 };
 }
 
-int main(int argc, char *argv[]) {
+void flipY(int w, int h, optix::float3 * c)
+{
+    for (size_t rowIdx = 0; rowIdx < h / 2; ++rowIdx)
+    {
+        for (size_t colIdx = 0; colIdx < w; ++colIdx)
+        {
+            std::swap(c[(h - rowIdx - 1) * w + colIdx], c[rowIdx * w + colIdx]);
+        }
+    }
+}
+
+void writeImage(int w, int h, const optix::float3 * c)
+{
+    FILE *f = fopen("image.ppm", "w");         // Write image to PPM file.
+    fprintf(f, "P3\n%d %d\n%d\n", w, h, 255);
+    for (int i = 0; i < w*h; i++)
+        fprintf(f, "%d %d %d ", toInt(c[i].x), toInt(c[i].y), toInt(c[i].z));
+}
+
+int cpuRender(int argc, char *argv[]) {
     const auto start = hr_clock::now();
 
     fprintf(stderr, "Starting rendering\n");
@@ -468,20 +492,207 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "\rRendering (%d spp) %5.2f%%", samps * 4, 100. * pixelCounter / pixelCount);
     }
 
-    for (size_t rowIdx = 0; rowIdx < h / 2; ++rowIdx)
-    {
-        for (size_t colIdx = 0; colIdx < w; ++colIdx)
-        {
-            std::swap(c[(h - rowIdx - 1) * w + colIdx], c[rowIdx * w + colIdx]);
-        }
-    }
-
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(hr_clock::now() - start);
 
     fprintf(stderr, "\nElapsed time: %d ms\n", elapsed.count());
 
-    FILE *f = fopen("image.ppm", "w");         // Write image to PPM file.
-    fprintf(f, "P3\n%d %d\n%d\n", w, h, 255);
-    for (int i = 0; i < w*h; i++)
-        fprintf(f, "%d %d %d ", toInt(c[i].x), toInt(c[i].y), toInt(c[i].z));
+    flipY(w, h, c.data());
+    writeImage(w, h, c.data());
+}
+
+#define CHK_PRIME( code )                                                      \
+{                                                                              \
+  RTPresult res__ = code;                                                      \
+  if( res__ != RTP_SUCCESS )                                                   \
+  {                                                                            \
+  const char* err_string;                                                      \
+  rtpContextGetLastErrorString( context, &err_string );                        \
+  std::cerr << "Error at <<" __FILE__ << "(" << __LINE__ << "): "              \
+            << err_string                                                      \
+  << "' (" << res__ << ")" << std::endl;                                       \
+  exit(1);                                                                     \
+  }                                                                            \
+}
+
+struct OptixRay
+{
+    static const RTPbufferformat format = RTP_BUFFER_FORMAT_RAY_ORIGIN_TMIN_DIRECTION_TMAX;
+
+    optix::float3 origin;
+    float  tmin;
+    optix::float3 dir;
+    float  tmax;
+};
+
+struct OptixHit
+{
+    static const RTPbufferformat format = RTP_BUFFER_FORMAT_HIT_T_TRIID_INSTID_U_V;
+
+    float t;
+    int   triId;
+    int   instId;
+    float u;
+    float v;
+};
+
+int main(int argc, char *argv[]) {
+    RTPcontext context;
+    rtpContextCreate(RTP_CONTEXT_TYPE_CUDA, &context);
+
+    unsigned int device = 0;
+    rtpContextSetCudaDeviceNumbers(context, 1, &device);
+
+    std::vector<RTPmodel> models(sphereCount);
+    std::vector<optix::float4> matrices(sphereCount * 3);
+    std::vector<RTPbufferdesc> vertexBuffers(sphereCount);
+    std::vector<RTPbufferdesc> indexBuffers(sphereCount);
+
+    for (size_t i = 0; i < sphereCount; ++i)
+    {
+        rtpBufferDescCreate(context, RTP_BUFFER_FORMAT_INDICES_INT3, RTP_BUFFER_TYPE_HOST, spheres[i].mesh.indexBuffer.data(), &indexBuffers[i]);
+        rtpBufferDescSetRange(indexBuffers[i], 0, spheres[i].mesh.triangleCount());
+
+        rtpBufferDescCreate(context, RTP_BUFFER_FORMAT_VERTEX_FLOAT3, RTP_BUFFER_TYPE_HOST, spheres[i].mesh.positionBuffer.data(), &vertexBuffers[i]);
+        rtpBufferDescSetRange(vertexBuffers[i], 0, spheres[i].mesh.positionBuffer.size());
+
+        rtpModelCreate(context, &models[i]);
+        rtpModelSetTriangles(models[i], indexBuffers[i], vertexBuffers[i]);
+        rtpModelUpdate(models[i], 0);
+        rtpModelFinish(models[i]);
+
+        matrices[i * 3 + 0] = optix::make_float4(1, 0, 0, 0);
+        matrices[i * 3 + 1] = optix::make_float4(0, 1, 0, 0);
+        matrices[i * 3 + 2] = optix::make_float4(0, 0, 1, 0);
+    }
+
+    RTPbufferdesc sceneInstanceBuffer;
+    rtpBufferDescCreate(context, RTP_BUFFER_FORMAT_INSTANCE_MODEL, RTP_BUFFER_TYPE_HOST, models.data(), &sceneInstanceBuffer);
+    rtpBufferDescSetRange(sceneInstanceBuffer, 0, models.size());
+
+    RTPbufferdesc sceneTransformBuffer;
+    rtpBufferDescCreate(context, RTP_BUFFER_FORMAT_TRANSFORM_FLOAT4x3, RTP_BUFFER_TYPE_HOST, matrices.data(), &sceneTransformBuffer);
+    rtpBufferDescSetRange(sceneTransformBuffer, 0, models.size());
+
+    RTPmodel sceneModel;
+    rtpModelCreate(context, &sceneModel);
+    rtpModelSetInstances(sceneModel, sceneInstanceBuffer, sceneTransformBuffer);
+    rtpModelUpdate(sceneModel, 0);
+    rtpModelFinish(sceneModel);
+
+    const auto start = hr_clock::now();
+
+    fprintf(stderr, "Starting rendering\n");
+
+    const int w = 256;
+    const int h = 256;
+    const int samps = argc == 2 ? atoi(argv[1]) / 4 : 1; // # samples
+    const Ray cam(make_float3(50, 52, 295.6), normalize(make_float3(0, -0.042612, -1))); // cam pos, dir
+    const auto cx = make_float3(w*.5135 / h);
+    const auto cy = normalize(cross(cx, cam.d))*.5135;
+    const auto threadCount = shn::getSystemThreadCount() - 2;
+    const auto pixelCount = w * h;
+    std::vector<optix::float3> c(pixelCount, make_float3());
+
+    const int jitterSize = 2;
+    const auto sampleCountPerPixel = jitterSize * jitterSize * samps;
+
+    std::uniform_real_distribution<float> randFloat(0.0, 1.0);
+
+    const auto foreachSampleInRow = [&](auto rowIdx, auto functor)
+    {
+        for (size_t colIdx = 0; colIdx < w; ++colIdx)
+        {
+            const auto pixelIdx = rowIdx * w + colIdx;
+            for (size_t sy = 0; sy < jitterSize; ++sy)
+            {
+                for (size_t sx = 0; sx < jitterSize; ++sx)
+                {
+                    const auto groupIdx = sy * jitterSize + sx;
+                    for (size_t s = 0; s < samps; ++s)
+                    {
+                        const auto indexInPixel = groupIdx * samps + s;
+                        const auto indexInImage = pixelIdx * sampleCountPerPixel + indexInPixel;
+
+                        functor(SampleIndex{ pixelIdx, colIdx, rowIdx, groupIdx, sx, sy, indexInImage, indexInPixel, s });
+                    }
+                }
+            }
+        }
+    };
+
+    std::vector<std::mt19937> generators(h);
+    std::vector<OptixRay> rays(w * h * sampleCountPerPixel);
+    std::vector<PathContrib> pathBuffer(w * h * sampleCountPerPixel);
+    std::vector<PathContrib> swapPathBuffer(w * h * sampleCountPerPixel);
+
+    shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId) // Loop over image rows
+    {
+        auto & generator = generators[rowIdx];
+
+        generator.seed(uint32_t(rowIdx * rowIdx * rowIdx));
+
+        // Sample all camera rays to initialize paths
+        foreachSampleInRow(rowIdx, [&](SampleIndex sampleIndex)
+        {
+            const float r1 = 2 * randFloat(generator);
+            const float dx = r1 < 1 ? sqrt(r1) - 1 : 1 - sqrt(2 - r1);
+            const float r2 = 2 * randFloat(generator);
+            const float dy = r2 < 1 ? sqrt(r2) - 1 : 1 - sqrt(2 - r2);
+            const optix::float3 d = cx*(((sampleIndex.groupColumn + .5 + dx) / jitterSize + sampleIndex.pixelColumn) / w - .5) +
+                cy*(((sampleIndex.groupRow + .5 + dy) / jitterSize + sampleIndex.pixelRow) / h - .5) + cam.d;
+            const Ray cameraRay(Ray(cam.o + d * 140, normalize(d))); // Camera rays are pushed forward to start in interior
+
+            auto & optixRay = rays[sampleIndex.indexInImage];
+            optixRay.origin = cameraRay.o;
+            optixRay.tmin = 0;
+            optixRay.dir = cameraRay.d;
+            optixRay.tmax = Hit::inf();
+
+            auto & path = pathBuffer[sampleIndex.indexInImage];
+            path.currentRay = cameraRay;
+            path.pixelIdx = sampleIndex.pixelIdx;
+            path.weight = optix::float3{ 1,1,1 };
+            path.depth = 0;
+        });
+    });
+
+    std::vector<OptixHit> hits(rays.size());
+
+    RTPbufferdesc raysDesc;
+    rtpBufferDescCreate(context, OptixRay::format, RTP_BUFFER_TYPE_HOST, rays.data(), &raysDesc);
+    rtpBufferDescSetRange(raysDesc, 0, rays.size());
+
+    RTPbufferdesc hitsDesc;
+    rtpBufferDescCreate(context, OptixHit::format, RTP_BUFFER_TYPE_HOST, hits.data(), &hitsDesc);
+    rtpBufferDescSetRange(hitsDesc, 0, hits.size());
+
+    RTPquery query;
+    rtpQueryCreate(sceneModel, RTP_QUERY_TYPE_CLOSEST, &query);
+    rtpQuerySetRays(query, raysDesc);
+    rtpQuerySetHits(query, hitsDesc);
+    rtpQueryExecute(query, 0);
+
+    shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId) // Loop over image rows
+    {
+        const auto pathOffset = rowIdx * w * sampleCountPerPixel;
+        const auto pathCount = w * sampleCountPerPixel;
+        for (size_t i = 0; i < pathCount; ++i)
+        {
+            const auto pathIdx = i + pathOffset;
+
+            const auto & path = pathBuffer[pathIdx];
+            if (hits[pathIdx].t > 0.0f)
+                c[path.pixelIdx] += optix::make_float3(1, 1, 1);
+        }
+
+        for (size_t colIdx = 0; colIdx < w; ++colIdx)
+        {
+            c[rowIdx * w + colIdx] /= sampleCountPerPixel;
+        }
+    });
+
+    rtpContextDestroy(context);
+
+    flipY(w, h, c.data());
+    writeImage(w, h, c.data());
 }
