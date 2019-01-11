@@ -166,22 +166,28 @@ struct Sphere {
     }
 
     float intersect(const Ray &r, optix::float3 & x, optix::float3 & n, optix::float2 & uv) const {
-        return intersectAnalytic(r, x, n, uv);
+        return intersectMesh(r, x, n, uv);
     }
 };
-Sphere spheres[] = {//Scene: radius, position, emission, color, material
-   //Sphere(10, make_float3(50, 40.8, 81.6), make_float3(),make_float3(.75,.25,.25),DIFF),
-  Sphere(1e5, make_float3(1e5 + 1,40.8,81.6), make_float3(),make_float3(.75,.25,.25),DIFF),//Left
-  Sphere(1e5, make_float3(-1e5 + 99,40.8,81.6),make_float3(),make_float3(.25,.25,.75),DIFF),//Rght
-  Sphere(1e5, make_float3(50,40.8, 1e5),     make_float3(),make_float3(.75,.75,.75),DIFF),//Back
-  Sphere(1e5, make_float3(50,40.8,-1e5 + 170), make_float3(),make_float3(),           DIFF),//Frnt
-  Sphere(1e5, make_float3(50, 1e5, 81.6),    make_float3(),make_float3(.75,.75,.75),DIFF),//Botm
-  Sphere(1e5, make_float3(50,-1e5 + 81.6,81.6),make_float3(),make_float3(.75,.75,.75),DIFF),//Top
-  Sphere(16.5,make_float3(27,16.5,47),       make_float3(),make_float3(1,1,1)*.999, SPEC),//Mirr
-  Sphere(16.5,make_float3(73,16.5,78),       make_float3(),make_float3(1,1,1)*.999, REFR),//Glas
-  Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(1,1,1),  make_float3(), DIFF)
-  //Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(1,1,1),  make_float3(), DIFF) //Lite
+
+Sphere spheres[] = {
+    Sphere(10, make_float3(50, 40.8, 81.6), make_float3(),make_float3(.75,.25,.25),DIFF),
+    Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(1,1,1),  make_float3(), DIFF) //Lite
 };
+
+//Sphere spheres[] = {//Scene: radius, position, emission, color, material
+//   //Sphere(10, make_float3(50, 40.8, 81.6), make_float3(),make_float3(.75,.25,.25),DIFF),
+//  Sphere(1e5, make_float3(1e5 + 1,40.8,81.6), make_float3(),make_float3(.75,.25,.25),DIFF),//Left
+//  Sphere(1e5, make_float3(-1e5 + 99,40.8,81.6),make_float3(),make_float3(.25,.25,.75),DIFF),//Rght
+//  Sphere(1e5, make_float3(50,40.8, 1e5),     make_float3(),make_float3(.75,.75,.75),DIFF),//Back
+//  Sphere(1e5, make_float3(50,40.8,-1e5 + 170), make_float3(),make_float3(),           DIFF),//Frnt
+//  Sphere(1e5, make_float3(50, 1e5, 81.6),    make_float3(),make_float3(.75,.75,.75),DIFF),//Botm
+//  Sphere(1e5, make_float3(50,-1e5 + 81.6,81.6),make_float3(),make_float3(.75,.75,.75),DIFF),//Top
+//  Sphere(16.5,make_float3(27,16.5,47),       make_float3(),make_float3(1,1,1)*.999, SPEC),//Mirr
+//  Sphere(16.5,make_float3(73,16.5,78),       make_float3(),make_float3(1,1,1)*.999, REFR),//Glas
+//  Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(1,1,1),  make_float3(), DIFF)
+//  //Sphere(600, make_float3(50,681.6 - .27,81.6),make_float3(1,1,1),  make_float3(), DIFF) //Lite
+//};
 
 inline float clamp(float x) { return x < 0 ? 0 : x>1 ? 1 : x; }
 
@@ -278,7 +284,7 @@ int main(int argc, char *argv[]) {
 
     const int w = 256;
     const int h = 256;
-    const int samps = argc == 2 ? atoi(argv[1]) / 4 : 32; // # samples
+    const int samps = argc == 2 ? atoi(argv[1]) / 4 : 1; // # samples
     const Ray cam(make_float3(50, 52, 295.6), normalize(make_float3(0, -0.042612, -1))); // cam pos, dir
     const auto cx = make_float3(w*.5135 / h);
     const auto cy = normalize(cross(cx, cam.d))*.5135;
@@ -320,7 +326,7 @@ int main(int argc, char *argv[]) {
 
         std::vector<PathContrib> pathBuffer(w * sampleCountPerPixel);
 
-        // Sample all camera rays to init paths
+        // Sample all camera rays to initialize paths
         foreachSampleInRow(rowIdx, [&](SampleIndex sampleIndex)
         {
             const float r1 = 2 * randFloat(generator);
