@@ -9,8 +9,10 @@
 #include <optix_prime/optix_prime.h>
 
 #include "ThreadUtils.h"
+#include <pector/pector.h>
 
 using hr_clock = std::chrono::high_resolution_clock;
+template<typename T> using Vector = pt::pector<T>;
 
 inline optix::float3 make_float3(float x = 0.f, float y = 0.f, float z = 0.f)
 {
@@ -18,9 +20,9 @@ inline optix::float3 make_float3(float x = 0.f, float y = 0.f, float z = 0.f)
 }
 
 struct TriMesh {
-    std::vector<optix::float3> positionBuffer;
-    std::vector<optix::float3> normalBuffer;
-    std::vector<uint32_t> indexBuffer;
+    Vector<optix::float3> positionBuffer;
+    Vector<optix::float3> normalBuffer;
+    Vector<uint32_t> indexBuffer;
 
     size_t triangleCount() const
     {
@@ -36,7 +38,7 @@ TriMesh makeSphereTriMesh(const optix::float3 origin, float radius, const uint32
     float rcpLat = 1.f / discLat, rcpLong = 1.f / discLong;
     float dPhi = M_PIf * 2.f * rcpLat, dTheta = M_PIf * rcpLong;
 
-    std::vector<optix::float3> positionBuffer, normalBuffer;
+    Vector<optix::float3> positionBuffer, normalBuffer;
 
     for (uint32_t j = 0; j <= discLong; ++j)
     {
@@ -55,7 +57,7 @@ TriMesh makeSphereTriMesh(const optix::float3 origin, float radius, const uint32
         }
     }
 
-    std::vector<uint32_t> indexBuffer;
+    Vector<uint32_t> indexBuffer;
 
     for (uint32_t j = 0; j < discLong; ++j)
     {
@@ -363,7 +365,7 @@ void cpuIntersect(const PathContrib * pathBuffer, size_t pathCount, Hit * hits)
     }
 }
 
-size_t shadePaths(const PathContrib * pathBuffer, size_t pathCount, const Hit * hitBuffer, std::vector<PathContrib> & nextPaths, optix::float3 * outColor, std::mt19937 & generator)
+size_t shadePaths(const PathContrib * pathBuffer, size_t pathCount, const Hit * hitBuffer, Vector<PathContrib> & nextPaths, optix::float3 * outColor, std::mt19937 & generator)
 {
     const std::uniform_real_distribution<float> randFloat(0.0, 1.0);
 
@@ -387,7 +389,9 @@ size_t shadePaths(const PathContrib * pathBuffer, size_t pathCount, const Hit * 
 
         const float p = optix::max(optix::max(f.x, f.y), f.z);
 
-        outColor[path.pixelIdx] += path.weight * obj.e;
+        //outColor[path.pixelIdx] += path.weight * obj.e;
+        outColor[path.pixelIdx] += nl;
+        continue;
 
         const auto depth = path.depth;
 
@@ -486,7 +490,8 @@ int cpuRender(int argc, char *argv[]) {
     const auto cy = normalize(cross(cx, cam.d))*.5135;
     const auto threadCount = shn::getSystemThreadCount() - 2;
     const auto pixelCount = w * h;
-    std::vector<optix::float3> c(pixelCount, make_float3());
+    Vector<optix::float3> c;
+    c.resize(pixelCount, make_float3());
 
     const int jitterSize = 2;
     const auto sampleCountPerPixel = jitterSize * jitterSize * samps;
@@ -520,7 +525,8 @@ int cpuRender(int argc, char *argv[]) {
     {
         std::mt19937 generator{ uint32_t(rowIdx * rowIdx * rowIdx) };
 
-        std::vector<PathContrib> pathBuffer(w * sampleCountPerPixel);
+        Vector<PathContrib> pathBuffer;
+        pathBuffer.resize_no_construct(w * sampleCountPerPixel);
 
         // Sample all camera rays to initialize paths
         foreachSampleInRow(rowIdx, [&](SampleIndex sampleIndex)
@@ -540,14 +546,16 @@ int cpuRender(int argc, char *argv[]) {
             path.depth = 0;
         });
 
-        std::vector<PathContrib> swapPathBuffer(w * sampleCountPerPixel);
-        std::vector<Hit> hitBuffer(pathBuffer.size());
+        Vector<PathContrib> swapPathBuffer;
+        swapPathBuffer.resize_no_construct(w * sampleCountPerPixel);
+        Vector<Hit> hitBuffer;
+        hitBuffer.resize_no_construct(pathBuffer.size());
 
         auto pathCount = pathBuffer.size();
 
         while (pathCount > 0)
         {
-            hitBuffer.resize(pathCount);
+            hitBuffer.resize_no_construct(pathCount);
             cpuIntersect(pathBuffer.data(), pathCount, hitBuffer.data());
 
             pathCount = shadePaths(pathBuffer.data(), pathCount, hitBuffer.data(), swapPathBuffer, c.data(), generator);
@@ -612,13 +620,17 @@ struct OptixHit
     float v;
 };
 
-std::vector<Hit> convertHits(const OptixHit * hits, size_t count, size_t threadCount)
+Vector<Hit> convertHits(const OptixHit * hits, size_t count, size_t threadCount)
 {
-    std::vector<Hit> newHits(count);
+    Vector<Hit> newHits;
+    newHits.resize_no_construct(count);
     shn::syncParallelLoop(count, threadCount, [&](size_t i, size_t threadId)
     {
         if (hits[i].t <= 0.f)
+        {
+            newHits[i] = {};
             return;
+        }
 
         MeshHit meshHit{ TriangleHit{hits[i].t, hits[i].u, hits[i].v}, uint32_t(hits[i].triId) };
         newHits[i] = spheres[hits[i].instId].makeHit(hits[i].instId, meshHit);
@@ -626,49 +638,162 @@ std::vector<Hit> convertHits(const OptixHit * hits, size_t count, size_t threadC
     return newHits;
 }
 
-int main(int argc, char *argv[]) {
+template<typename Begin, typename End, typename Functor>
+auto map(Begin begin, End && end, Functor && f) -> Vector<decltype(f(*begin))>
+{
+    using RetT = decltype(f(*begin));
+    Vector<RetT> v;
+    v.resize_no_construct(end - begin);
+    for (size_t i = 0; begin != end; ++begin)
+        v[i++] = f(*begin);
+    return v;
+}
+
+struct CPUIntersector
+{
+    CPUIntersector(size_t threadCount) : m_threadCount(threadCount)
+    {
+    }
+
+    void addTriangleMesh(const TriMesh & mesh)
+    {
+        m_meshes.emplace_back(&mesh);
+    }
+
+    void finish()
+    {
+
+    }
+
+    Vector<Hit> traceRays(const PathContrib * paths, size_t pathCount)
+    {
+        Vector<Hit> hits;
+        hits.resize_no_construct(pathCount);
+        shn::syncParallelLoop(pathCount, m_threadCount, [&](auto pathIdx, auto threadIdx)
+        {
+            cpuIntersect(&paths[pathIdx], 1, &hits[pathIdx]);
+        });
+        return hits;
+    }
+
+    size_t m_threadCount;
+    Vector<const TriMesh*> m_meshes;
+};
+
+struct OptixIntersector
+{
+    OptixIntersector(size_t threadCount): m_threadCount(threadCount)
+    {
+        rtpContextCreate(RTP_CONTEXT_TYPE_CUDA, &context);
+        unsigned int device = 0;
+        rtpContextSetCudaDeviceNumbers(context, 1, &device);
+    }
+
+    ~OptixIntersector()
+    {
+        rtpContextDestroy(context);
+    }
+
+    void addTriangleMesh(const TriMesh & mesh)
+    {
+        models.emplace_back();
+        auto & model = models.back();
+
+        vertexBuffers.emplace_back();
+        auto & vertexBuffer = vertexBuffers.back();
+
+        indexBuffers.emplace_back();
+        auto & indexBuffer = indexBuffers.back();
+
+        rtpBufferDescCreate(context, RTP_BUFFER_FORMAT_INDICES_INT3, RTP_BUFFER_TYPE_HOST, (void*) mesh.indexBuffer.data(), &indexBuffer);
+        rtpBufferDescSetRange(indexBuffer, 0, mesh.triangleCount());
+
+        rtpBufferDescCreate(context, RTP_BUFFER_FORMAT_VERTEX_FLOAT3, RTP_BUFFER_TYPE_HOST, (void*)mesh.positionBuffer.data(), &vertexBuffer);
+        rtpBufferDescSetRange(vertexBuffer, 0, mesh.positionBuffer.size());
+
+        rtpModelCreate(context, &model);
+        rtpModelSetTriangles(model, indexBuffer, vertexBuffer);
+        rtpModelUpdate(model, 0);
+        rtpModelFinish(model);
+
+        matrices.emplace_back(optix::make_float4(1, 0, 0, 0));
+        matrices.emplace_back(optix::make_float4(0, 1, 0, 0));
+        matrices.emplace_back(optix::make_float4(0, 0, 1, 0));
+    }
+
+    void finish()
+    {
+        rtpBufferDescCreate(context, RTP_BUFFER_FORMAT_INSTANCE_MODEL, RTP_BUFFER_TYPE_HOST, models.data(), &sceneInstanceBuffer);
+        rtpBufferDescSetRange(sceneInstanceBuffer, 0, models.size());
+
+        rtpBufferDescCreate(context, RTP_BUFFER_FORMAT_TRANSFORM_FLOAT4x3, RTP_BUFFER_TYPE_HOST, matrices.data(), &sceneTransformBuffer);
+        rtpBufferDescSetRange(sceneTransformBuffer, 0, models.size());
+
+        rtpModelCreate(context, &sceneModel);
+        rtpModelSetInstances(sceneModel, sceneInstanceBuffer, sceneTransformBuffer);
+        rtpModelUpdate(sceneModel, 0);
+        rtpModelFinish(sceneModel);
+    }
+
+    Vector<Hit> traceRays(const PathContrib * paths, size_t pathCount)
+    {
+        Vector<OptixRay> optixRays;
+        optixRays.resize_no_construct(pathCount);
+        Vector<OptixHit> optixHits;
+        optixHits.resize_no_construct(pathCount);
+
+        shn::syncParallelLoop(pathCount, m_threadCount, [&](auto pathIdx, auto threadId)
+        {
+            auto & optixRay = optixRays[pathIdx];
+            const auto & path = paths[pathIdx];
+            optixRay.origin = path.currentRay.o;
+            optixRay.tmin = 0;
+            optixRay.dir = path.currentRay.d;
+            optixRay.tmax = Hit::inf();
+        });
+
+        RTPbufferdesc raysDesc;
+        rtpBufferDescCreate(context, OptixRay::format, RTP_BUFFER_TYPE_HOST, optixRays.data(), &raysDesc);
+        rtpBufferDescSetRange(raysDesc, 0, optixRays.size());
+
+        RTPbufferdesc hitsDesc;
+        rtpBufferDescCreate(context, OptixHit::format, RTP_BUFFER_TYPE_HOST, optixHits.data(), &hitsDesc);
+        rtpBufferDescSetRange(hitsDesc, 0, optixHits.size());
+
+        RTPquery query;
+        rtpQueryCreate(sceneModel, RTP_QUERY_TYPE_CLOSEST, &query);
+        rtpQuerySetRays(query, raysDesc);
+        rtpQuerySetHits(query, hitsDesc);
+        rtpQueryExecute(query, 0);
+
+       return convertHits(optixHits.data(), pathCount, m_threadCount);
+    }
+
+    size_t m_threadCount;
     RTPcontext context;
-    rtpContextCreate(RTP_CONTEXT_TYPE_CUDA, &context);
 
-    unsigned int device = 0;
-    rtpContextSetCudaDeviceNumbers(context, 1, &device);
+    // Meshs
+    Vector<RTPmodel> models;
+    Vector<optix::float4> matrices;
+    Vector<RTPbufferdesc> vertexBuffers;
+    Vector<RTPbufferdesc> indexBuffers;
 
-    std::vector<RTPmodel> models(sphereCount);
-    std::vector<optix::float4> matrices(sphereCount * 3);
-    std::vector<RTPbufferdesc> vertexBuffers(sphereCount);
-    std::vector<RTPbufferdesc> indexBuffers(sphereCount);
+    RTPbufferdesc sceneInstanceBuffer;
+    RTPbufferdesc sceneTransformBuffer;
+    RTPmodel sceneModel;
+};
+
+int main(int argc, char *argv[]) 
+{
+    return cpuRender(argc, argv);
+    const auto threadCount = shn::getSystemThreadCount() - 2;
+    OptixIntersector intersector{ threadCount };
 
     for (size_t i = 0; i < sphereCount; ++i)
     {
-        rtpBufferDescCreate(context, RTP_BUFFER_FORMAT_INDICES_INT3, RTP_BUFFER_TYPE_HOST, spheres[i].mesh.indexBuffer.data(), &indexBuffers[i]);
-        rtpBufferDescSetRange(indexBuffers[i], 0, spheres[i].mesh.triangleCount());
-
-        rtpBufferDescCreate(context, RTP_BUFFER_FORMAT_VERTEX_FLOAT3, RTP_BUFFER_TYPE_HOST, spheres[i].mesh.positionBuffer.data(), &vertexBuffers[i]);
-        rtpBufferDescSetRange(vertexBuffers[i], 0, spheres[i].mesh.positionBuffer.size());
-
-        rtpModelCreate(context, &models[i]);
-        rtpModelSetTriangles(models[i], indexBuffers[i], vertexBuffers[i]);
-        rtpModelUpdate(models[i], 0);
-        rtpModelFinish(models[i]);
-
-        matrices[i * 3 + 0] = optix::make_float4(1, 0, 0, 0);
-        matrices[i * 3 + 1] = optix::make_float4(0, 1, 0, 0);
-        matrices[i * 3 + 2] = optix::make_float4(0, 0, 1, 0);
+        intersector.addTriangleMesh(spheres[i].mesh);
     }
-
-    RTPbufferdesc sceneInstanceBuffer;
-    rtpBufferDescCreate(context, RTP_BUFFER_FORMAT_INSTANCE_MODEL, RTP_BUFFER_TYPE_HOST, models.data(), &sceneInstanceBuffer);
-    rtpBufferDescSetRange(sceneInstanceBuffer, 0, models.size());
-
-    RTPbufferdesc sceneTransformBuffer;
-    rtpBufferDescCreate(context, RTP_BUFFER_FORMAT_TRANSFORM_FLOAT4x3, RTP_BUFFER_TYPE_HOST, matrices.data(), &sceneTransformBuffer);
-    rtpBufferDescSetRange(sceneTransformBuffer, 0, models.size());
-
-    RTPmodel sceneModel;
-    rtpModelCreate(context, &sceneModel);
-    rtpModelSetInstances(sceneModel, sceneInstanceBuffer, sceneTransformBuffer);
-    rtpModelUpdate(sceneModel, 0);
-    rtpModelFinish(sceneModel);
+    intersector.finish();
 
     const auto start = hr_clock::now();
 
@@ -680,9 +805,9 @@ int main(int argc, char *argv[]) {
     const Ray cam(make_float3(50, 52, 295.6), normalize(make_float3(0, -0.042612, -1))); // cam pos, dir
     const auto cx = make_float3(w*.5135 / h);
     const auto cy = normalize(cross(cx, cam.d))*.5135;
-    const auto threadCount = shn::getSystemThreadCount() - 2;
     const auto pixelCount = w * h;
-    std::vector<optix::float3> c(pixelCount, make_float3());
+    Vector<optix::float3> c;
+    c.resize(pixelCount, make_float3());
 
     const int jitterSize = 2;
     const auto sampleCountPerPixel = jitterSize * jitterSize * samps;
@@ -711,11 +836,15 @@ int main(int argc, char *argv[]) {
         }
     };
 
-    std::vector<std::mt19937> generators(h);
+    Vector<std::mt19937> generators;
+    generators.resize(h);
     
-    std::vector<PathContrib> pathBuffer(w * h * sampleCountPerPixel);
-    std::vector<size_t> pathOffsetPerRow(h);
-    std::vector<size_t> pathCountPerRow(h);
+    Vector<PathContrib> pathBuffer;
+    pathBuffer.resize_no_construct(w * h * sampleCountPerPixel);
+    Vector<size_t> pathOffsetPerRow;
+    pathOffsetPerRow.resize_no_construct(h);
+    Vector<size_t> pathCountPerRow;
+    pathCountPerRow.resize_no_construct(h);
 
     shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId) // Loop over image rows
     {
@@ -746,40 +875,14 @@ int main(int argc, char *argv[]) {
     });
 
     size_t pathCount = pathBuffer.size();
-    std::vector<std::vector<PathContrib>> nextPathsPerRow(h);
+    Vector<Vector<PathContrib>> nextPathsPerRow;
+    nextPathsPerRow.resize(h);
     for (size_t rowIdx = 0; rowIdx < h; ++rowIdx)
         nextPathsPerRow.resize(w * sampleCountPerPixel);
 
     while (pathCount > 0)
     {
-        std::vector<OptixRay> optixRays(pathCount);
-        std::vector<OptixHit> optixHits(pathCount);
-
-        shn::syncParallelLoop(pathCount, threadCount, [&](auto pathIdx, auto threadId)
-        {
-            auto & optixRay = optixRays[pathIdx];
-            const auto & path = pathBuffer[pathIdx];
-            optixRay.origin = path.currentRay.o;
-            optixRay.tmin = 0;
-            optixRay.dir = path.currentRay.d;
-            optixRay.tmax = Hit::inf();
-        });
-
-        RTPbufferdesc raysDesc;
-        rtpBufferDescCreate(context, OptixRay::format, RTP_BUFFER_TYPE_HOST, optixRays.data(), &raysDesc);
-        rtpBufferDescSetRange(raysDesc, 0, optixRays.size());
-
-        RTPbufferdesc hitsDesc;
-        rtpBufferDescCreate(context, OptixHit::format, RTP_BUFFER_TYPE_HOST, optixHits.data(), &hitsDesc);
-        rtpBufferDescSetRange(hitsDesc, 0, optixHits.size());
-
-        RTPquery query;
-        rtpQueryCreate(sceneModel, RTP_QUERY_TYPE_CLOSEST, &query);
-        rtpQuerySetRays(query, raysDesc);
-        rtpQuerySetHits(query, hitsDesc);
-        rtpQueryExecute(query, 0);
-
-        const auto hits = convertHits(optixHits.data(), pathCount, threadCount);
+        const auto hits = intersector.traceRays(pathBuffer.data(), pathCount);
 
         shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId)
         {
@@ -790,22 +893,20 @@ int main(int argc, char *argv[]) {
             pathCountPerRow[rowIdx] = shadePaths(&pathBuffer[pathOffset], pathCount, &hits[pathOffset], nextPathsPerRow[rowIdx], c.data(), generators[rowIdx]);
         });
 
-        size_t totalPathCount = 0;
+        pathCount = 0;
         for (size_t rowIdx = 0; rowIdx < h; ++rowIdx)
         {
-            pathOffsetPerRow[rowIdx] = totalPathCount;
-            totalPathCount += pathCountPerRow[rowIdx];
+            pathOffsetPerRow[rowIdx] = pathCount;
+            pathCount += pathCountPerRow[rowIdx];
         }
 
-        pathBuffer.resize(totalPathCount);
+        pathBuffer.resize(pathCount);
         shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId)
         {
             const auto offset = pathOffsetPerRow[rowIdx];
             const auto count = pathCountPerRow[rowIdx];
             std::copy(begin(nextPathsPerRow[rowIdx]), begin(nextPathsPerRow[rowIdx]) + pathCountPerRow[rowIdx], begin(pathBuffer) + offset);
         });
-
-        pathCount = totalPathCount;
     }
 
     shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId) // Loop over image rows
@@ -815,8 +916,6 @@ int main(int argc, char *argv[]) {
             c[rowIdx * w + colIdx] /= sampleCountPerPixel;
         }
     });
-
-    rtpContextDestroy(context);
 
     flipY(w, h, c.data());
     writeImage(w, h, c.data());
