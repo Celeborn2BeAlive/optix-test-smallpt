@@ -19,6 +19,13 @@ inline optix::float3 make_float3(float x = 0.f, float y = 0.f, float z = 0.f)
     return optix::float3{ x, y, z };
 }
 
+inline optix::float3 int2color(int32_t n)
+{
+    optix::float3 x = float(n + 1) * optix::make_float3(12.9898f, 78.233f, 56.128f);
+    x = optix::make_float3(sin(x.x), sin(x.y), sin(x.z)) * 43758.5453f;
+    return optix::make_float3(x.x - int32_t(x.x), x.y - int32_t(x.y), x.z - int32_t(x.z));
+}
+
 struct TriMesh {
     Vector<optix::float3> positionBuffer;
     Vector<optix::float3> normalBuffer;
@@ -114,6 +121,7 @@ struct Hit
     static inline float inf() { return 1e20; };
     float dist = inf();
     uint32_t instId;
+    uint32_t triId;
     optix::float3 x;
     optix::float3 n;
     optix::float2 uv;
@@ -137,14 +145,15 @@ Hit makeHit(uint32_t instId, const TriMesh & mesh, const MeshHit & meshHit)
     Hit hit;
     hit.dist = meshHit.dist;
     hit.instId = instId;
+    hit.triId = meshHit.triId;
 
     const auto u = meshHit.u;
     const auto v = meshHit.v;
     const auto w = 1.f - u - v;
 
-    const auto i1 = mesh.indexBuffer[meshHit.triId];
-    const auto i2 = mesh.indexBuffer[meshHit.triId + 1];
-    const auto i3 = mesh.indexBuffer[meshHit.triId + 2];
+    const auto i1 = mesh.indexBuffer[meshHit.triId * 3];
+    const auto i2 = mesh.indexBuffer[meshHit.triId * 3 + 1];
+    const auto i3 = mesh.indexBuffer[meshHit.triId * 3 + 2];
 
     hit.x = w * mesh.positionBuffer[i1] + u * mesh.positionBuffer[i2] + v * mesh.positionBuffer[i3];
     hit.n = w * mesh.normalBuffer[i1] + u * mesh.normalBuffer[i2] + v * mesh.normalBuffer[i3];
@@ -173,7 +182,7 @@ MeshHit intersect(const optix::float3 ro, const optix::float3 rd, const TriMesh 
     if (minDistance <= 0.f || minDistance == std::numeric_limits<float>::max())
         return{};
 
-    return { minHit, minIdx };
+    return { minHit, minIdx / 3 };
 }
 
 struct Ray { 
@@ -390,7 +399,9 @@ size_t shadePaths(const PathContrib * pathBuffer, size_t pathCount, const Hit * 
         const float p = optix::max(optix::max(f.x, f.y), f.z);
 
         //outColor[path.pixelIdx] += path.weight * obj.e;
-        outColor[path.pixelIdx] += nl;
+        //outColor[path.pixelIdx] += nl;
+        //outColor[path.pixelIdx] += optix::make_float3(hit.uv.x, hit.uv.y, 0);
+        outColor[path.pixelIdx] += int2color(hit.triId);
         continue;
 
         const auto depth = path.depth;
@@ -696,6 +707,8 @@ struct OptixIntersector
 
     void addTriangleMesh(const TriMesh & mesh)
     {
+        m_meshes.emplace_back(&mesh);
+
         models.emplace_back();
         auto & model = models.back();
 
@@ -766,7 +779,24 @@ struct OptixIntersector
         rtpQuerySetHits(query, hitsDesc);
         rtpQueryExecute(query, 0);
 
-       return convertHits(optixHits.data(), pathCount, m_threadCount);
+        const auto convertedHits = convertHits(optixHits.data(), pathCount, m_threadCount);
+
+        //Vector<Hit> hits;
+        //hits.resize_no_construct(pathCount);
+        //shn::syncParallelLoop(pathCount, m_threadCount, [&](auto pathIdx, auto threadIdx)
+        //{
+        //    cpuIntersect(&paths[pathIdx], 1, &hits[pathIdx]);
+        //});
+
+        //for (size_t i = 0; i < pathCount; ++i)
+        //{
+        //    if (hits[i].triId != convertedHits[i].triId)
+        //    {
+        //        std::cerr << i << ", " << hits[i].triId << ", " << convertedHits[i].triId << std::endl;
+        //    }
+        //}
+
+        return convertedHits;
     }
 
     size_t m_threadCount;
@@ -781,13 +811,14 @@ struct OptixIntersector
     RTPbufferdesc sceneInstanceBuffer;
     RTPbufferdesc sceneTransformBuffer;
     RTPmodel sceneModel;
+
+    Vector<const TriMesh*> m_meshes;
 };
 
 int main(int argc, char *argv[]) 
 {
-    return cpuRender(argc, argv);
     const auto threadCount = shn::getSystemThreadCount() - 2;
-    OptixIntersector intersector{ threadCount };
+    CPUIntersector intersector{ threadCount };
 
     for (size_t i = 0; i < sphereCount; ++i)
     {
@@ -882,6 +913,7 @@ int main(int argc, char *argv[])
 
     while (pathCount > 0)
     {
+        std::clog << "Trace rays" << std::endl;
         const auto hits = intersector.traceRays(pathBuffer.data(), pathCount);
 
         shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId)
