@@ -1,6 +1,7 @@
+file(GLOB SRC_FILES *.h *.cpp)
+
 OPTIX_add_sample_executable( smallptOptix
-  smallpt.cpp
-  ThreadUtils.h
+  ${SRC_FILES}
 )
 
 target_include_directories(smallptOptix PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
