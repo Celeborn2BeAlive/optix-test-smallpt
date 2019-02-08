@@ -642,11 +642,8 @@ int main(int argc, char *argv[])
 
     const int w = 256;
     const int h = 256;
-    const int samps = argc == 2 ? atoi(argv[1]) / 4 : 16; // # samples
-    //const Ray cam(make_float3(50, 52, 295.6), normalize(make_float3(0, 0, -1))); // cam pos, dir
+    const int sampleCountPerJitterCell = argc == 2 ? atoi(argv[1]) / 4 : 16; // # samples
     const Ray cam(make_float3(0, 0, 0), normalize(make_float3(0, 0, -1)));
-    //const auto cx = make_float3(w*.5135 / h, 0.f, 0.f);
-    //const auto cy = normalize(cross(cx, cam.d))*.5135;
 
     const auto cx = make_float3(1, 0, 0);
     const auto cy = normalize(cross(cx, cam.d));
@@ -655,8 +652,8 @@ int main(int argc, char *argv[])
     Vector<float3> c;
     c.resize(pixelCount, make_float3(0, 0, 0));
 
-    const int jitterSize = 2;
-    const auto sampleCountPerPixel = jitterSize * jitterSize * samps;
+    const int jitterSize = 2; // each pixel is virtually subdivided in jitterSize * jitterSize square cells, for better sampling
+    const auto sampleCountPerPixel = jitterSize * jitterSize * sampleCountPerJitterCell;
 
     std::uniform_real_distribution<float> randFloat(0.0, 1.0);
 
@@ -670,9 +667,9 @@ int main(int argc, char *argv[])
                 for (size_t sx = 0; sx < jitterSize; ++sx)
                 {
                     const auto groupIdx = sy * jitterSize + sx;
-                    for (size_t s = 0; s < samps; ++s)
+                    for (size_t s = 0; s < sampleCountPerJitterCell; ++s)
                     {
-                        const auto indexInPixel = groupIdx * samps + s;
+                        const auto indexInPixel = groupIdx * sampleCountPerJitterCell + s;
                         const auto indexInImage = pixelIdx * sampleCountPerPixel + indexInPixel;
 
                         functor(SampleIndex{ pixelIdx, colIdx, rowIdx, groupIdx, sx, sy, indexInImage, indexInPixel, s });
@@ -701,37 +698,29 @@ int main(int argc, char *argv[])
         // Sample all camera rays to initialize paths
         foreachSampleInRow(rowIdx, [&](SampleIndex sampleIndex)
         {
-            //const float r1 = 2 * randFloat(generator); // [0, 2]
-            //const float dx = r1 < 1 ? sqrt(r1) - 1 : 1 - sqrt(2 - r1); // [-1, 1]
-            //
-            //const float r2 = 2 * randFloat(generator);
-            //const float dy = r2 < 1 ? sqrt(r2) - 1 : 1 - sqrt(2 - r2);
+            const auto jitterCellSize = make_float2(1.f / jitterSize, 1.f / jitterSize); // cell size relative to pixel
+            const auto pixelSize = make_float2(1.f / w, 1.f / h); // pixel size relative to image
 
-            const float jitter_cell_size = 1.f / jitterSize;
-            const float pixel_size_x = 1.f / w;
-            const float pixel_size_y = 1.f / h;
+            const auto randNumbers = make_float2(randFloat(generator), randFloat(generator));
 
-            const float r1 = randFloat(generator);
-            const float r2 = randFloat(generator);
+            const auto jitteredRandNumbers = (make_float2(sampleIndex.groupColumn, sampleIndex.groupRow) + randNumbers) * jitterCellSize;
 
-            const float r1_jitt = (sampleIndex.groupColumn + r1) * jitter_cell_size;
-            const float r2_jitt = (sampleIndex.groupRow + r2) * jitter_cell_size;
-
-            // should return numbers centered arround [0, 0]
-            const auto sample_filter = [](float r1, float r2) -> float2 {
+            // Should return numbers centered arround [0, 0]
+            const auto samplePixelFilter = [](float r1, float r2) -> float2 {
                 return 0.5 * make_float2(2 * r1 - 1, 2 * r2 - 1); // box filter in [-0.5, 0.5]
             };
 
-            const auto filter_sample = sample_filter(r1_jitt, r2_jitt);
+            // Sample relative to pixel space
+            const auto jitteredSample = samplePixelFilter(jitteredRandNumbers.x, jitteredRandNumbers.y);
 
-            // raster space:
-            const float pixel_sample_x = sampleIndex.pixelColumn + 0.5f + filter_sample.x;
-            const float pixel_sample_y = sampleIndex.pixelRow + 0.5f + filter_sample.y;
+            const auto pixelCenterInRasterSpace = make_float2(sampleIndex.pixelColumn + 0.5f, sampleIndex.pixelRow + 0.5f);
 
-            const float x = 2.f * pixel_sample_x * pixel_size_x - 1.f;
-            const float y = 2.f * pixel_sample_y * pixel_size_y - 1.f;
+            const auto samplePositionInRasterSpace = pixelCenterInRasterSpace + jitteredSample; // in [0 - filterExtentW, w + filterExtentH] x [0 - filterExtentW, h + filterExtentH]
+            const auto samplePositionInNormalizedRasterSpace = samplePositionInRasterSpace * pixelSize; // in [0 - NormalizedFilterExtendW, 1 + NormalizedFilterExtendW] x [0 - NormalizedFilterExtendH, 1 + NormalizedFilterExtendH]
 
-            const float3 d = normalize(x * cx + y * cy + cam.d);
+            const auto sampleInClipSpace = 2.f * samplePositionInNormalizedRasterSpace - make_float2(1.f, 1.f);
+
+            const auto d = normalize(sampleInClipSpace.x * cx + sampleInClipSpace.y * cy + cam.d);
             const Ray cameraRay(cam.o, d);
 
             auto & path = pathBuffer[sampleIndex.indexInImage];
