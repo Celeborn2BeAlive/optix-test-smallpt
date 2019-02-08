@@ -433,7 +433,7 @@ struct CPUIntersector
 
     }
 
-    Hit intersect(const Ray & r)
+    Hit intersect(const Ray & r) const
     {
         MeshHit nearestHit;
         size_t nearestInst;
@@ -450,7 +450,7 @@ struct CPUIntersector
         return makeHit(nearestInst, m_meshes[nearestInst], nearestHit);
     }
 
-    Vector<Hit> traceRays(const PathContrib * paths, size_t pathCount)
+    Vector<Hit> traceRays(const PathContrib * paths, size_t pathCount) const
     {
         Vector<Hit> hits;
         hits.resize_no_construct(pathCount);
@@ -522,7 +522,7 @@ struct OptixIntersector
         rtpModelFinish(sceneModel);
     }
 
-    Vector<Hit> convertHits(const OptixHit * hits, size_t count)
+    Vector<Hit> convertHits(const OptixHit * hits, size_t count) const
     {
         Vector<Hit> newHits;
         newHits.resize_no_construct(count);
@@ -543,7 +543,7 @@ struct OptixIntersector
         return newHits;
     }
 
-    Vector<Hit> traceRays(const PathContrib * paths, size_t pathCount)
+    Vector<Hit> traceRays(const PathContrib * paths, size_t pathCount) const
     {
         Vector<OptixRay> optixRays;
         optixRays.resize_no_construct(pathCount);
@@ -610,6 +610,63 @@ struct OptixIntersector
     Vector<const TriMesh*> m_meshes;
 };
 
+class RenderOutputs
+{
+    size_t size() const
+    {
+        return m_colors.size();
+    }
+
+    float3 * colors()
+    {
+        return m_colors.data();
+    }
+
+    float * weights()
+    {
+        return m_weights.data();
+    }
+
+    const float3 * colors() const
+    {
+        return m_colors.data();
+    }
+
+    const float * weights() const
+    {
+        return m_weights.data();
+    }
+
+private:
+    std::vector<float3> m_colors;
+    std::vector<float> m_weights;
+};
+
+using Intersector = OptixIntersector;
+
+struct ViewSpace
+{
+    float3 vx;
+    float3 vy;
+    float3 vz;
+    float3 org;
+};
+
+struct Camera
+{
+    ViewSpace space;
+    float near;
+    float cx;
+    float cy;
+};
+
+
+
+//RenderOutputs render(const Intersector & intersector, const Material * materials, size_t imageWidth, size_t imageHeight)
+//{
+//
+//}
+
 int main(int argc, char *argv[]) 
 {
     TriMesh triangle;
@@ -620,7 +677,7 @@ int main(int argc, char *argv[])
     Material material{ make_float3(1, 0, 0), make_float3(0, 0, 0), DIFF };
 
     const auto threadCount = shn::getSystemThreadCount() - 2;
-    OptixIntersector intersector{ threadCount };
+    Intersector intersector{ threadCount };
 
     /*for (size_t i = 0; i < sphereCount; ++i)
     {
@@ -643,11 +700,16 @@ int main(int argc, char *argv[])
     const int w = 256;
     const int h = 256;
     const int sampleCountPerJitterCell = argc == 2 ? atoi(argv[1]) / 4 : 16; // # samples
-    const Ray cam(make_float3(0, 0, 0), normalize(make_float3(0, 0, -1)));
-
-    const auto cx = make_float3(1, 0, 0);
-    const auto cy = normalize(cross(cx, cam.d));
-
+    
+    Camera camera;
+    camera.space.vx = make_float3(1, 0, 0);
+    camera.space.vz = make_float3(0, 0, -1);
+    camera.space.vy = normalize(cross(camera.space.vx, camera.space.vz));
+    camera.space.org = make_float3(0, 0, 0);
+    camera.cx = 1.f;
+    camera.cy = 1.f;
+    camera.near = 1.f;
+    
     const auto pixelCount = w * h;
     Vector<float3> c;
     c.resize(pixelCount, make_float3(0, 0, 0));
@@ -720,8 +782,8 @@ int main(int argc, char *argv[])
 
             const auto sampleInClipSpace = 2.f * samplePositionInNormalizedRasterSpace - make_float2(1.f, 1.f);
 
-            const auto d = normalize(sampleInClipSpace.x * cx + sampleInClipSpace.y * cy + cam.d);
-            const Ray cameraRay(cam.o, d);
+            const auto d = normalize(sampleInClipSpace.x * camera.cx * camera.space.vx + sampleInClipSpace.y * camera.cy * camera.space.vy + camera.near * camera.space.vz);
+            const Ray cameraRay(camera.space.org, d);
 
             auto & path = pathBuffer[sampleIndex.indexInImage];
             path.currentRay = cameraRay;
