@@ -32,6 +32,7 @@ inline std::future<void> asyncParallelRun(uint32_t threadCount, TaskFunctor task
     struct SharedData
     {
         std::promise<void> p;
+
         ~SharedData()
         {
             p.set_value();

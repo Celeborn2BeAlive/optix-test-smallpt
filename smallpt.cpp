@@ -12,6 +12,13 @@
 #include "maths.h"
 #include "scene.h"
 
+#include "glutils.h"
+#include <glfw/glfw3.h>
+
+#include <json-2.0.9/json.hpp>
+
+using json = nlohmann::json;
+
 using hr_clock = std::chrono::high_resolution_clock;
 
 inline float3 int2color(int32_t n)
@@ -164,7 +171,7 @@ size_t shadePaths(const Material * materials, const PathContrib * pathBuffer, si
 
         float3 x = hit.x + 0.02 * hit.n;
         float3 n = hit.n;
-        float3 nl = dot(n, r.d) < 0 ? n : n*-1;
+        float3 nl = n;//dot(n, r.d) < 0 ? n : n*-1;
         float3 f = material.color;
 
         const float p = optix::max(optix::max(f.x, f.y), f.z);
@@ -576,21 +583,6 @@ struct OptixIntersector
 
         const auto convertedHits = convertHits(optixHits.data(), pathCount);
 
-        //Vector<Hit> hits;
-        //hits.resize_no_construct(pathCount);
-        //shn::syncParallelLoop(pathCount, m_threadCount, [&](auto pathIdx, auto threadIdx)
-        //{
-        //    cpuIntersect(&paths[pathIdx], 1, &hits[pathIdx]);
-        //});
-
-        //for (size_t i = 0; i < pathCount; ++i)
-        //{
-        //    if (hits[i].triId != convertedHits[i].triId)
-        //    {
-        //        std::cerr << i << ", " << hits[i].triId << ", " << convertedHits[i].triId << std::endl;
-        //    }
-        //}
-
         return convertedHits;
     }
 
@@ -609,6 +601,45 @@ struct OptixIntersector
 
     Vector<const TriMesh*> m_meshes;
 };
+
+using Intersector = OptixIntersector;
+
+struct Camera
+{
+    Camera(float3 vx, float3 vy, float3 vz, float3 org, float nearPlaneDistance):
+        nearPlaneDistance(nearPlaneDistance)
+    {
+        localToWorld.setCol(0, make_float4(vx.x, vx.y, vx.z, 0));
+        localToWorld.setCol(1, make_float4(vy.x, vy.y, vy.z, 0));
+        localToWorld.setCol(2, make_float4(vz.x, vz.y, vz.z, 0));
+        localToWorld.setCol(3, make_float4(org.x, org.y, org.z, 1));
+
+        worldToLocal = localToWorld.inverse();
+    }
+
+    float4x4 localToWorld;
+    float4x4 worldToLocal;
+
+    float nearPlaneDistance;
+};
+
+Ray sampleRay(const float2 & randNumbers, const float2 & pixelSize, size_t pixelColumn, size_t pixelRow, const Camera & camera)
+{
+    const auto pixelCenterInRasterSpace = make_float2(pixelColumn + 0.5f, pixelRow + 0.5f);
+
+    const auto samplePositionInRasterSpace = pixelCenterInRasterSpace + randNumbers; // in [0 - filterExtentW, w + filterExtentH] x [0 - filterExtentW, h + filterExtentH]
+    const auto samplePositionInNormalizedRasterSpace = samplePositionInRasterSpace * pixelSize; // in [0 - NormalizedFilterExtendW, 1 + NormalizedFilterExtendW] x [0 - NormalizedFilterExtendH, 1 + NormalizedFilterExtendH]
+
+    const auto sampleInClipSpace = 2.f * samplePositionInNormalizedRasterSpace - make_float2(1.f, 1.f);
+
+    const auto direction = camera.localToWorld * make_float4(sampleInClipSpace.x, sampleInClipSpace.y, camera.nearPlaneDistance, 0.f);
+
+    const auto d = normalize(make_float3(direction.x, direction.y, direction.z));
+    const auto org = camera.localToWorld.getCol(3);
+
+    return{ make_float3(org.x, org.y, org.z), d };
+}
+
 
 class RenderOutputs
 {
@@ -638,92 +669,45 @@ class RenderOutputs
     }
 
 private:
-    std::vector<float3> m_colors;
-    std::vector<float> m_weights;
+    Vector<float3> m_colors;
+    Vector<float> m_weights;
 };
 
-using Intersector = OptixIntersector;
-
-struct ViewSpace
+class Renderer
 {
-    float3 vx;
-    float3 vy;
-    float3 vz;
-    float3 org;
-};
+public:
+    Vector<float3> render(const Camera & camera, const Intersector & intersector, const Material * materials,
+        size_t imageWidth, size_t imageHeight, size_t sampleCountPerJitterCell, size_t threadCount, size_t seed);
 
-struct Camera
-{
-    ViewSpace space;
-    float near;
-    float cx;
-    float cy;
+private:
+    const std::uniform_real_distribution<float> randFloat{ 0.0, 1.0 };
+    Vector<std::mt19937> generators;
+    Vector<PathContrib> pathBuffer;
+    Vector<size_t> pathOffsetPerRow;
+    Vector<size_t> pathCountPerRow;
+    Vector<Vector<PathContrib>> nextPathsPerRow;
 };
 
 
-
-//RenderOutputs render(const Intersector & intersector, const Material * materials, size_t imageWidth, size_t imageHeight)
-//{
-//
-//}
-
-int main(int argc, char *argv[]) 
+Vector<float3> Renderer::render(const Camera & camera, const Intersector & intersector, const Material * materials,
+    size_t imageWidth, size_t imageHeight, size_t sampleCountPerJitterCell, size_t threadCount, size_t seed)
 {
-    TriMesh triangle;
-    triangle.positionBuffer = { make_float3(-0.5, -0.5, -1), make_float3(0.5, -0.5, -1), make_float3(0, 0.5, -1) };
-    triangle.normalBuffer = { make_float3(1, 0, 0), make_float3(0, 1, 0), make_float3(0, 0, 1) };
-    triangle.indexBuffer = { 0, 1, 2 };
-
-    Material material{ make_float3(1, 0, 0), make_float3(0, 0, 0), DIFF };
-
-    const auto threadCount = shn::getSystemThreadCount() - 2;
-    Intersector intersector{ threadCount };
-
-    /*for (size_t i = 0; i < sphereCount; ++i)
-    {
-        intersector.addTriangleMesh(spheres[i].mesh);
-    }
-    intersector.build();
-
-    Vector<Material> materials;
-    for (size_t i = 0; i < sphereCount; ++i)
-        materials.emplace_back(spheres[i].material);*/
-
-    intersector.addTriangleMesh(triangle);
-    intersector.build();
-    Vector<Material> materials = { material };
-
     const auto start = hr_clock::now();
 
     fprintf(stderr, "Starting rendering\n");
 
-    const int w = 256;
-    const int h = 256;
-    const int sampleCountPerJitterCell = argc == 2 ? atoi(argv[1]) / 4 : 16; // # samples
-    
-    Camera camera;
-    camera.space.vx = make_float3(1, 0, 0);
-    camera.space.vz = make_float3(0, 0, -1);
-    camera.space.vy = normalize(cross(camera.space.vx, camera.space.vz));
-    camera.space.org = make_float3(0, 0, 0);
-    camera.cx = 1.f;
-    camera.cy = 1.f;
-    camera.near = 1.f;
-    
-    const auto pixelCount = w * h;
-    Vector<float3> c;
-    c.resize(pixelCount, make_float3(0, 0, 0));
+    const auto pixelCount = imageWidth * imageHeight;
+    Vector<float3> outImage;
+    outImage.resize(pixelCount, make_float3(0, 0, 0));
 
     const int jitterSize = 2; // each pixel is virtually subdivided in jitterSize * jitterSize square cells, for better sampling
     const auto sampleCountPerPixel = jitterSize * jitterSize * sampleCountPerJitterCell;
 
-    std::uniform_real_distribution<float> randFloat(0.0, 1.0);
-
     const auto foreachSampleInRow = [&](auto rowIdx, auto functor)
     {
-        for (size_t colIdx = 0; colIdx < w; ++colIdx)
+        for (size_t colIdx = 0; colIdx < imageWidth; ++colIdx)
         {
-            const auto pixelIdx = rowIdx * w + colIdx;
+            const auto pixelIdx = rowIdx * imageWidth + colIdx;
             for (size_t sy = 0; sy < jitterSize; ++sy)
             {
                 for (size_t sx = 0; sx < jitterSize; ++sx)
@@ -741,27 +725,25 @@ int main(int argc, char *argv[])
         }
     };
 
-    Vector<std::mt19937> generators;
-    generators.resize(h);
-    
-    Vector<PathContrib> pathBuffer;
-    pathBuffer.resize_no_construct(w * h * sampleCountPerPixel);
-    Vector<size_t> pathOffsetPerRow;
-    pathOffsetPerRow.resize_no_construct(h);
-    Vector<size_t> pathCountPerRow;
-    pathCountPerRow.resize_no_construct(h);
+    generators.resize(imageHeight);
 
-    shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId) // Loop over image rows
+    pathBuffer.resize_no_construct(imageWidth * imageHeight * sampleCountPerPixel);
+    
+    pathOffsetPerRow.resize_no_construct(imageHeight);
+    
+    pathCountPerRow.resize_no_construct(imageHeight);
+
+    shn::syncParallelLoop(imageHeight, threadCount, [&](auto rowIdx, auto threadId) // Loop over image rows
     {
         auto & generator = generators[rowIdx];
 
-        generator.seed(uint32_t(rowIdx * rowIdx * rowIdx));
+        generator.seed(uint32_t(seed * imageHeight + rowIdx));
 
         // Sample all camera rays to initialize paths
         foreachSampleInRow(rowIdx, [&](SampleIndex sampleIndex)
         {
             const auto jitterCellSize = make_float2(1.f / jitterSize, 1.f / jitterSize); // cell size relative to pixel
-            const auto pixelSize = make_float2(1.f / w, 1.f / h); // pixel size relative to image
+            const auto pixelSize = make_float2(1.f / imageWidth, 1.f / imageHeight); // pixel size relative to image
 
             const auto randNumbers = make_float2(randFloat(generator), randFloat(generator));
 
@@ -775,15 +757,7 @@ int main(int argc, char *argv[])
             // Sample relative to pixel space
             const auto jitteredSample = samplePixelFilter(jitteredRandNumbers.x, jitteredRandNumbers.y);
 
-            const auto pixelCenterInRasterSpace = make_float2(sampleIndex.pixelColumn + 0.5f, sampleIndex.pixelRow + 0.5f);
-
-            const auto samplePositionInRasterSpace = pixelCenterInRasterSpace + jitteredSample; // in [0 - filterExtentW, w + filterExtentH] x [0 - filterExtentW, h + filterExtentH]
-            const auto samplePositionInNormalizedRasterSpace = samplePositionInRasterSpace * pixelSize; // in [0 - NormalizedFilterExtendW, 1 + NormalizedFilterExtendW] x [0 - NormalizedFilterExtendH, 1 + NormalizedFilterExtendH]
-
-            const auto sampleInClipSpace = 2.f * samplePositionInNormalizedRasterSpace - make_float2(1.f, 1.f);
-
-            const auto d = normalize(sampleInClipSpace.x * camera.cx * camera.space.vx + sampleInClipSpace.y * camera.cy * camera.space.vy + camera.near * camera.space.vz);
-            const Ray cameraRay(camera.space.org, d);
+            const auto cameraRay = sampleRay(jitteredSample, pixelSize, sampleIndex.pixelColumn, sampleIndex.pixelRow, camera);
 
             auto & path = pathBuffer[sampleIndex.indexInImage];
             path.currentRay = cameraRay;
@@ -792,39 +766,39 @@ int main(int argc, char *argv[])
             path.depth = 0;
         });
 
-        pathOffsetPerRow[rowIdx] = sampleCountPerPixel * w * rowIdx;
-        pathCountPerRow[rowIdx] = sampleCountPerPixel * w;
+        pathOffsetPerRow[rowIdx] = sampleCountPerPixel * imageWidth * rowIdx;
+        pathCountPerRow[rowIdx] = sampleCountPerPixel * imageWidth;
     });
 
     size_t pathCount = pathBuffer.size();
-    Vector<Vector<PathContrib>> nextPathsPerRow;
-    nextPathsPerRow.resize(h);
-    for (size_t rowIdx = 0; rowIdx < h; ++rowIdx)
-        nextPathsPerRow.resize(w * sampleCountPerPixel);
+    
+    nextPathsPerRow.resize(imageHeight);
+    for (size_t rowIdx = 0; rowIdx < imageHeight; ++rowIdx)
+        nextPathsPerRow.resize(imageWidth * sampleCountPerPixel);
 
     while (pathCount > 0)
     {
         std::clog << "Trace rays" << std::endl;
         const auto hits = intersector.traceRays(pathBuffer.data(), pathCount);
 
-        shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId)
+        shn::syncParallelLoop(imageHeight, threadCount, [&](auto rowIdx, auto threadId)
         {
             const auto pathOffset = pathOffsetPerRow[rowIdx];
             const auto pathCount = pathCountPerRow[rowIdx];
             if (!pathCount)
                 return;
-            pathCountPerRow[rowIdx] = shadePaths(materials.data(), &pathBuffer[pathOffset], pathCount, &hits[pathOffset], nextPathsPerRow[rowIdx], c.data(), generators[rowIdx]);
+            pathCountPerRow[rowIdx] = shadePaths(materials, &pathBuffer[pathOffset], pathCount, &hits[pathOffset], nextPathsPerRow[rowIdx], outImage.data(), generators[rowIdx]);
         });
 
         pathCount = 0;
-        for (size_t rowIdx = 0; rowIdx < h; ++rowIdx)
+        for (size_t rowIdx = 0; rowIdx < imageHeight; ++rowIdx)
         {
             pathOffsetPerRow[rowIdx] = pathCount;
             pathCount += pathCountPerRow[rowIdx];
         }
 
         pathBuffer.resize(pathCount);
-        shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId)
+        shn::syncParallelLoop(imageHeight, threadCount, [&](auto rowIdx, auto threadId)
         {
             const auto offset = pathOffsetPerRow[rowIdx];
             const auto count = pathCountPerRow[rowIdx];
@@ -832,14 +806,200 @@ int main(int argc, char *argv[])
         });
     }
 
-    shn::syncParallelLoop(h, threadCount, [&](auto rowIdx, auto threadId) // Loop over image rows
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(hr_clock::now() - start);
+
+    fprintf(stderr, "Elapsed time: %d ms\n", elapsed.count());
+
+    return outImage;
+}
+
+const auto threadCount = shn::getSystemThreadCount() - 2;
+
+struct SingleTriangleScene
+{
+    TriMesh triangle;
+    Material material{ make_float3(1, 0, 0), make_float3(0, 0, 0), DIFF };
+    Intersector intersector{ threadCount };
+
+    SingleTriangleScene()
     {
-        for (size_t colIdx = 0; colIdx < w; ++colIdx)
+        triangle.positionBuffer = { make_float3(-0.5, -0.5, -2), make_float3(0.5, -0.5, -2), make_float3(0, 0.5, -2) };
+        triangle.normalBuffer = { make_float3(1, 0, 0), make_float3(0, 1, 0), make_float3(0, 0, 1) };
+        triangle.indexBuffer = { 0, 1, 2 };
+
+        intersector.addTriangleMesh(triangle);
+        intersector.build();
+    }
+
+    const Material * materials() const
+    {
+        return &material;
+    }
+};
+
+int main(int argc, char *argv[]) 
+{
+    SingleTriangleScene scene;
+
+    const int imageWidth = 1280;
+    const int imageHeight = 720;
+    const int sampleCountPerJitterCell = argc == 2 ? atoi(argv[1]) / 4 : 1; // # samples
+    const auto jitterSize = 2;
+    const auto sampleCountPerPixel = jitterSize * jitterSize * sampleCountPerJitterCell;
+    
+    const float ratio = float(imageWidth) / imageHeight;
+    const float fovy = 70.f;
+
+    const auto windowWidth = imageWidth;
+    const auto windowHeight = imageHeight;
+
+    if (!glfwInit())
+    {
+        std::cerr << "Unable to init GLFW.\n";
+        return -1;
+    }
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 4);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GL_TRUE);
+    glfwWindowHint(GLFW_RESIZABLE, GL_FALSE);
+    glfwWindowHint(GLFW_SAMPLES, 4);
+
+    const auto window = glfwCreateWindow(windowWidth, windowHeight, "smallptx", nullptr, nullptr);
+
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(0); // No VSync
+
+    if (!gladLoadGL()) {
+        std::cerr << "Unable to init OpenGL.\n";
+        return -1;
+    }
+
+    initGLDebugOutput();
+
+    std::mutex accumBufferMutex;
+    Vector<float3> accumBuffer;
+    accumBuffer.resize(imageWidth * imageHeight, make_float3(0, 0, 0));
+
+    auto vx = make_float3(1, 0, 0);
+    auto vz = make_float3(0, 0, -1);
+    auto vy = normalize(cross(vx, vz));
+    auto org = make_float3(0, -1, 0);
+
+    std::mutex renderRequestsMutex;
+    Vector<json> renderRequests;
+
+    size_t sampleCount = 0;
+    float renderDone = false;
+    std::thread renderThread([&]()
+    {
+        Renderer renderer;
+
+        Camera camera{ vx, vy, vz, org, 1.f };
+
+        while (!renderDone)
         {
-            c[rowIdx * w + colIdx] /= sampleCountPerPixel;
+            bool needClearBuffer = false;
+
+            {
+                std::unique_lock<std::mutex> l{ renderRequestsMutex };
+                if (!renderRequests.empty())
+                {
+                    for (const auto & request : renderRequests)
+                    {
+                        if (request["action"] == "update_camera")
+                        {
+                            std::vector<float> newOrg = request["org"];
+                            camera = Camera{ vx, vy, vz, make_float3(newOrg[0], newOrg[1], newOrg[2]), 1.f };
+                            needClearBuffer = true;
+                        }
+                    }
+                    renderRequests.resize(0);
+                }
+            }
+
+            auto outImage = renderer.render(camera, scene.intersector, scene.materials(), imageWidth, imageHeight, sampleCountPerJitterCell, threadCount, sampleCount);
+
+            {
+                std::unique_lock<std::mutex> l{ accumBufferMutex };
+                ++sampleCount;
+                shn::syncParallelLoop(imageHeight, threadCount, [&](auto rowIdx, auto threadId) // Loop over image rows
+                {
+                    for (size_t colIdx = 0; colIdx < imageWidth; ++colIdx)
+                    {
+                        if (needClearBuffer) {
+                            accumBuffer[rowIdx * imageWidth + colIdx] = make_float3(0, 0, 0);
+                        }
+
+                        accumBuffer[rowIdx * imageWidth + colIdx] += outImage[rowIdx * imageWidth + colIdx];
+                    }
+                });
+                if (needClearBuffer)
+                    sampleCount = 1;
+            }
         }
     });
 
-    flipY(w, h, c.data());
-    writeImage(w, h, c.data());
+    GLImageRenderer imageRenderer;
+
+    while (!glfwWindowShouldClose(window))
+    {
+        const auto seconds = glfwGetTime();
+
+        glViewport(0, 0, windowWidth, windowHeight);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        float weight;
+        Vector<float3> image;
+        {
+            std::unique_lock<std::mutex> l{ accumBufferMutex };
+            weight = 1.f / (sampleCount * sampleCountPerPixel);
+            image = accumBuffer;
+        }
+
+        const float weight3[3] = { weight, weight, weight };
+        imageRenderer.drawWeightedRGBImage((const float *)image.data(), imageWidth, imageHeight, weight3);
+
+        glfwPollEvents();
+
+        bool camHasChanged = false;
+
+        if (glfwGetKey(window, GLFW_KEY_UP)) {
+            org.y += 0.01;
+            camHasChanged = true;
+        }
+
+        if (glfwGetKey(window, GLFW_KEY_DOWN)) {
+            org.y -= 0.01;
+            camHasChanged = true;
+        }
+
+        if (camHasChanged)
+        {
+            std::unique_lock<std::mutex> l{ renderRequestsMutex };
+            renderRequests.emplace_back(json::object({
+                { "action", "update_camera" },
+                { "org", json::array({org.x, org.y, org.z}) }
+            }));
+        }
+
+        glfwSwapBuffers(window);
+    }
+
+    glfwTerminate();
+
+    renderDone = true;
+    renderThread.join();
+
+    shn::syncParallelLoop(imageHeight, threadCount, [&](auto rowIdx, auto threadId) // Loop over image rows
+    {
+        for (size_t colIdx = 0; colIdx < imageWidth; ++colIdx)
+        {
+            accumBuffer[rowIdx * imageWidth + colIdx] /= (sampleCount * sampleCountPerPixel);
+        }
+    });
+
+    flipY(imageWidth, imageHeight, accumBuffer.data());
+    writeImage(imageWidth, imageHeight, accumBuffer.data());
 }
