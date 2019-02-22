@@ -174,7 +174,7 @@ size_t shadePaths(const Material * materials, const PathContrib * pathBuffer, si
         float3 nl = n;//dot(n, r.d) < 0 ? n : n*-1;
         float3 f = material.color;
 
-        const float p = optix::max(optix::max(f.x, f.y), f.z);
+        const float p = optix::fmaxf(f);
 
         //outColor[path.pixelIdx] += path.weight * material.emission;
         outColor[path.pixelIdx] += nl;
